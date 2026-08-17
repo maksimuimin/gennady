@@ -1,0 +1,12 @@
+{
+  "stack": {
+    "node": {
+      "skip": ["lint"],
+      "gates": {
+        "gennady": {
+          "argv": ["npx", "tsx", "cli/gennady.ts", "lint", "cli/", "shared/", "services/"]
+        }
+      }
+    }
+  }
+}

@@ -215,6 +215,55 @@ npx gennady lint ./src --autofix --verbose
 
 ---
 
+### ✅ `verify`
+
+Стек-агностичные верификационные гейты: **одна команда для любого стека**. Плагины: `node` (гейты из npm-скриптов `package.json`) и `golang` (`go build`, `go vet`, `gofmt -l`, `golangci-lint`, `go test`). Стек определяется автоматически; в одном репозитории могут быть активны оба.
+
+```bash
+# План без запуска — начните с этого в незнакомом репозитории
+npx gennady verify --plan
+
+# Гейты по изменениям относительно базовой ветки (по умолчанию)
+npx gennady verify
+
+# Явная цель / весь репозиторий / подмножество гейтов
+npx gennady verify internal/userapi
+npx gennady verify --all
+npx gennady verify --only=build,vet
+npx gennady verify --skip=lint
+```
+
+**Опции:**
+
+- `--plan`, `--dry-run`: показать детекцию, диагностику и план, ничего не запуская
+- `--all` / `--changed`: весь репозиторий / изменённые пакеты (по умолчанию)
+- `--only=<a,b>` / `--skip=<a,b>`: подмножество гейтов из плана
+- `--stack=<id>`: ограничиться одним плагином (`node` | `golang`)
+- `--tidy`: golang — добавить проверку дрейфа `go.mod` (`go mod tidy -diff`)
+- `--root=<path>`, `--timeout=<sec>`, `--json`
+
+**Конфиг репозитория** — секция `stack` в `gennady.config.json` (коммитится; личный `.gennadyrc` может переопределить): переопределения и расширения встроенных плагинов, чтобы разные репозитории не порождали разные команды:
+
+```json
+{
+  "stack": {
+    "use": ["golang"],
+    "golang": {
+      "skip": ["lint"],
+      "testTimeout": "10m",
+      "gates": { "test": { "argv": ["make", "test"] } },
+      "extraGates": [{ "id": "codegen-drift", "argv": ["make", "check-generated"] }]
+    }
+  }
+}
+```
+
+**Контракт:** RUN-ALL (все гейты выполняются, отказы накапливаются); SUPPRESS-ON-SUCCESS (успешные гейты молчат); гейты **не изменяют** рабочее дерево (`gofmt -l`, а не `go fmt`); отказ инструмента (паника линтера, недоступный module proxy) помечается `ENV_FAIL` — это не findings по коду. Коды выхода: `0` всё прошло · `1` гейт упал · `4` неверный вызов · `5` стек не распознан.
+
+Подробнее: [`specs/stack/stack.spec.md`](specs/stack/stack.spec.md), [`ai/directives/infra/golang-setup.xml`](ai/directives/infra/golang-setup.xml), навык `sdd-infra-golang`.
+
+---
+
 ### 🗯️ `alt-opinion`
 
 Мульти-модельные мнения с опциональным синтезом.
