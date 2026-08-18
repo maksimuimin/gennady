@@ -3,7 +3,7 @@
 // @tasks: TSK-95
 
 /** Identifier of a built-in stack plugin. */
-export type StackId = 'node' | 'golang';
+export type StackId = 'node' | 'golang' | 'android';
 
 /**
  * @purpose An environment problem surfaced before any gate runs — actionable, never silent.
@@ -82,7 +82,11 @@ export type Gate = {
   readonly label: string;
   /** @purpose argv, executed without a shell. Empty when skipped. */
   readonly argv: readonly string[];
-  /** @purpose Working directory for the gate. */
+  /**
+   * @purpose Real-tree absolute working directory — plugins set it; runner rewrites to
+   *   `<replica>/relpath(git-root, gate.cwd)` before spawn (§8.2). Passed unchanged under
+   *   UNSANDBOXED_RUN.
+   */
   readonly cwd: string;
   /** @purpose Environment variables merged over process.env; config-supplied wins. */
   readonly env?: Readonly<Record<string, string>>;
@@ -264,8 +268,9 @@ export type StackPlugin = {
    */
   detect(root: string): StackDetection | null;
   /**
-   * @purpose Ignored paths symlinked into the run replica: the stack's execution
-   *   environment, not tree state (node: node_modules). Spec D-STACK-013.
+   * @purpose Paths symlinked into the run replica — stack execution environment, not tree
+   *   state (e.g. `node_modules`, `.gradle`, `.kotlin`). Ignored under UNSANDBOXED_RUN
+   *   (D-STACK-013, D-STACK-016).
    */
   readonly sandboxLinks?: readonly string[];
   /** @purpose The mandatory verify facet. */

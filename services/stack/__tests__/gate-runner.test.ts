@@ -1,6 +1,6 @@
 // @file: Unit tests for the gate runner — RUN-ALL, stdout contract, env-fail predicates, report format.
 // @consumers: CI
-// @tasks: TSK-95
+// @tasks: TSK-95, TSK-97
 
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import type { Gate, StackDiagnostic, StackRun } from '../stack.types.ts';
+import type { Gate, StackDiagnostic, StackPlugin, StackRun } from '../stack.types.ts';
 
 const { runVerify, formatVerifyReport, exitAbove, outputMatches } =
   await import('../gate-runner.ts');
@@ -436,5 +436,113 @@ describe('runVerify — run replica enforcement (spec §2, D-STACK-013)', () => 
 
       assert.equal(report.results[0]?.status, 'pass', report.results[0]?.output);
     });
+  });
+
+  it('runVerify in a subdirectory of git-root: cwd relpath applied and output paths rewritten to real tree', () => {
+    // git init in parent; gate.cwd = <parent>/android
+    // Runner must: (a) execute in <replica>/android; (b) rewrite <replica>/android/… → <real>/android/…
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'android-subdir-'));
+    try {
+      const android = path.join(parent, 'android');
+      fs.mkdirSync(android, { recursive: true });
+      fs.writeFileSync(path.join(parent, 'README.md'), 'root\n');
+      fs.writeFileSync(path.join(android, 'build.gradle.kts'), 'plugins {}\n');
+      fixtureGit(parent, 'init', '-q', '-b', 'main');
+      fixtureGit(parent, 'add', '-A');
+      fixtureGit(parent, 'commit', '-qm', 'init');
+
+      // Gate runs in android/ subdir; command fails and emits a path that includes a file
+      // under the gate's cwd — runner will rewrite <replica>/android/… → <real>/android/…
+      const sentinelFile = 'build.gradle.kts';
+      const gate: Gate = {
+        ...shellGate('build', `echo "$PWD/${sentinelFile}:10: error"; exit 1`),
+        cwd: android,
+      };
+
+      const report = runVerify([runOf([gate])], []);
+      const realAndroid = fs.realpathSync(android);
+      const output = report.results[0]?.output ?? '';
+
+      // (a) gate ran with cwd inside <replica>/android — verified via path-rewrite roundtrip:
+      //     if runner set cwd to <replica>/android, the command printed <replica>/android/build.gradle.kts:10:
+      //     which was rewritten to <real>/android/build.gradle.kts:10: — observable in output
+      assert.ok(
+        output.includes(`${realAndroid}/${sentinelFile}:10:`),
+        `output must contain real android path; got: ${output}`
+      );
+      // (b) no replica path (i.e. /tmp/worktree- prefix) remains in the output
+      assert.ok(
+        !output.includes('/tmp/worktree-'),
+        `replica path must not remain in output; got: ${output}`
+      );
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it('UNSANDBOXED_RUN with sandboxLinks plugin: sandboxLinks ignored, .gradle sentinel untouched, output contains real path', () => {
+    // Fixture dir WITHOUT a .git repo → triggers UNSANDBOXED_RUN path
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'android-unsandboxed-'));
+    try {
+      // Place a sentinel file in .gradle/ to verify it is never symlinked or modified
+      const gradleDir = path.join(dir, '.gradle');
+      const sentinel = path.join(gradleDir, 'sentinel.txt');
+      fs.mkdirSync(gradleDir, { recursive: true });
+      fs.writeFileSync(sentinel, 'original\n');
+
+      // Gate: fails and prints its own cwd — so we can verify no replica path appears
+      const gate: Gate = {
+        ...shellGate('build', 'echo "$PWD/App.kt:5: error"; exit 1'),
+        cwd: dir,
+      };
+
+      // Stub plugin with non-empty sandboxLinks (android-like) to confirm they are ignored
+      const stubPlugin: StackPlugin = {
+        id: 'android',
+        marker: 'settings.gradle.kts',
+        description: 'stub android plugin for unsandboxed test',
+        sandboxLinks: ['.gradle', '.kotlin'],
+        detect: () => null,
+        verify: {
+          resolveScope: (d, r) => ({ mode: r.mode, note: 'stub', details: null }),
+          planGates: () => [],
+        },
+      };
+
+      const report = runVerify([runOf([gate])], [], {
+        sandboxLinks: stubPlugin.sandboxLinks,
+      });
+
+      // (a) UNSANDBOXED_RUN diagnostic must appear
+      assert.ok(
+        report.diagnostics.some((d) => d.code === 'UNSANDBOXED_RUN'),
+        'UNSANDBOXED_RUN diagnostic must be present'
+      );
+
+      // (b) no replica directory created (no worktree dirs in /tmp from this run)
+      // Verified via sentinel: .gradle/ was not symlinked (original content preserved, not a symlink)
+      assert.ok(!fs.lstatSync(gradleDir).isSymbolicLink(), '.gradle must not be a symlink');
+      assert.equal(
+        fs.readFileSync(sentinel, 'utf-8'),
+        'original\n',
+        'sentinel file must be untouched'
+      );
+
+      // (c)+(d) gate ran with real cwd (no replica path rewrite); output contains real dir path
+      const output = report.results[0]?.output ?? '';
+      const realDir = fs.realpathSync(dir);
+      assert.ok(
+        output.includes(`${realDir}/App.kt:5:`),
+        `output must contain real cwd path; got: ${output}`
+      );
+
+      // (f) no replica path prefix appears in output
+      assert.ok(
+        !output.includes('/tmp/worktree-'),
+        `no replica path prefix must appear in output; got: ${output}`
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

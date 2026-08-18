@@ -39,4 +39,4 @@ graph TD
 | ------ | ------------------------------------------------------------ | -------- |
 | TSK-95 | stack library: types, config, registry, runner, node+golang  | [x] DONE |
 | TSK-96 | `gennady verify` command, verify.sh delegation, docs, skills | [x] DONE |
-| TSK-97 | android plugin: detect + verify + sandboxLinks + invariants  | [ ] TODO |
+| TSK-97 | android plugin: detect + verify + sandboxLinks + invariants  | [x] DONE |

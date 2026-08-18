@@ -70,13 +70,33 @@ type ReplicaSlot =
  * @consumer runVerify (internal)
  */
 type ReplicaPool = {
-  /** @purpose Resolve the execution slot for a gate cwd. */
+  /** @purpose Return the slot for a gate cwd — creates a replica on first call per toplevel. */
   acquire(cwd: string): ReplicaSlot;
   /** @purpose True when at least one gate ran in the real tree (no git repo or HEAD). */
   unsandboxedSeen(): boolean;
   /** @purpose Remove every replica this run created. */
   cleanupAll(): void;
 };
+
+/**
+ * @purpose Walk up from `start` to find the nearest `.git` — enables UNSANDBOXED_RUN detection
+ *   without invoking git, skipping sandboxLinks and relpath rewrite (§8.2).
+ * @param start Directory to walk from.
+ * @returns The directory that owns `.git`, or null when none exists up to the filesystem root.
+ */
+function findGitDir(start: string): string | null {
+  let current = start;
+  while (true) {
+    if (fs.existsSync(path.join(current, '.git'))) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
 
 /**
  * @purpose Build the pool; replicas materialize on first acquire per toplevel.
@@ -89,6 +109,13 @@ function createReplicaPool(links: readonly string[]): ReplicaPool {
 
   return {
     acquire(cwd) {
+      // UNSANDBOXED_RUN branch: no `.git` anywhere up the tree — spec §8.2 invariant.
+      // We never spawn `git rev-parse` here; sandboxLinks are ignored; the caller uses
+      // gate.cwd directly and the replica-path rewrite is a no-op (there is no replica).
+      if (findGitDir(cwd) === null) {
+        unsandboxed = true;
+        return { kind: 'unsandboxed' };
+      }
       const toplevel = execFileTrimSafe('git', ['rev-parse', '--show-toplevel'], cwd);
       if (toplevel.length === 0) {
         unsandboxed = true;

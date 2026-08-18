@@ -1,6 +1,6 @@
 // @file: Unit tests for SyncSkillsCore — scanSkills, collectAndCompareSkills
 // @consumers: SyncSkillsCore
-// @tasks: TSK-57
+// @tasks: TSK-57, TSK-97
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,7 +14,6 @@ import {
   readdirSync,
   statSync,
   unlinkSync,
-  rmdirSync,
 } from 'node:fs';
 import { writeFileSync as _writeFileReal, mkdirSync as _mkdirReal } from 'node:fs';
 import { join } from 'node:path';
@@ -59,7 +58,8 @@ function createMockDeps(
       }
     },
     unlink: unlinkSync,
-    rmdir: (p: string, opts?: { recursive: boolean }) => rmdirSync(p, opts),
+    rmdir: (p: string, opts?: { recursive: boolean }) =>
+      rmSync(p, { recursive: opts?.recursive ?? false, force: true }),
     ...overrides,
   };
 }

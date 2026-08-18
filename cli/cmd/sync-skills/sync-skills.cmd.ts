@@ -1,6 +1,6 @@
 // @file: SyncSkills command — CLI entry point for gennady sync-skills: parseArgs, resolve package, compare + copy skills.
 // @consumers: gennady.ts, sync-skills.cmd.test.ts
-// @tasks: TSK-57
+// @tasks: TSK-57, TSK-97
 
 import {
   readFileSync,
@@ -9,7 +9,7 @@ import {
   statSync,
   readdirSync,
   unlinkSync,
-  rmdirSync,
+  rmSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -65,7 +65,10 @@ export function run(rawArgs: string[], deps?: SyncCmdDeps): number {
   const _stat = deps?.stat ?? statSync;
   const _readdir = deps?.readdir ?? readdirSync;
   const _unlink = deps?.unlink ?? unlinkSync;
-  const _rmdir = deps?.rmdir ?? rmdirSync;
+  const _rmdir =
+    deps?.rmdir ??
+    ((p: string, opts?: { recursive: boolean }) =>
+      rmSync(p, { recursive: opts?.recursive ?? false, force: true }));
   const _resolvePackageDir = deps?.resolvePackageDir ?? resolvePackageDir;
   const _stdout = deps?.stdout ?? process.stdout;
   const _stderr = deps?.stderr ?? process.stderr;

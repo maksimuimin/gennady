@@ -1,6 +1,6 @@
 // @file: TypeScript tree-sitter adapter implementing DbcAstAdapter for parsing .ts files.
 // @consumers: DbcTsLinter
-// @tasks: TSK-08, TSK-11, TSK-88
+// @tasks: TSK-08, TSK-11, TSK-88, TSK-97
 
 import { readFileSync } from 'node:fs';
 import type { default as Parser } from 'tree-sitter';
@@ -362,6 +362,7 @@ export class DbcTsAstAdapter implements DbcAstAdapter {
     let type = 'any';
     let optional = paramNode.type === 'optional_parameter';
     let isRest = false;
+    let seenEquals = false;
 
     for (let i = 0; i < paramNode.childCount; i += 1) {
       const child = paramNode.child(i);
@@ -396,17 +397,20 @@ export class DbcTsAstAdapter implements DbcAstAdapter {
         continue;
       }
 
-      // Default initializer `=` makes a required_parameter effectively optional
+      // Default initializer `=` makes a required_parameter effectively optional;
+      // any identifier that follows is the default value, not the param name.
       if (child.type === '=') {
         optional = true;
+        seenEquals = true;
         continue;
       }
 
-      // Identifier / destructuring pattern
+      // Identifier / destructuring pattern — only extract param name before `=`
       if (
-        child.type === 'identifier' ||
-        child.type === 'object_pattern' ||
-        child.type === 'array_pattern'
+        !seenEquals &&
+        (child.type === 'identifier' ||
+          child.type === 'object_pattern' ||
+          child.type === 'array_pattern')
       ) {
         name = source.slice(child.startIndex, child.endIndex);
         continue;
