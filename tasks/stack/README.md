@@ -27,7 +27,10 @@ Tier order (low → high priority on collision): `traversed-scopes` → `target-
 graph TD
     TSK-95[TSK-95: stack library — types, config, registry, runner, node+golang plugins]
     TSK-96[TSK-96: gennady verify command + verify.sh delegation + docs]
+    TSK-97[TSK-97: android plugin — detect, verify plan, sandboxLinks, cwd/UNSANDBOXED invariants]
     TSK-96 --> TSK-95
+    TSK-97 --> TSK-95
+    TSK-97 --> TSK-96
 ```
 
 ## Tracker
@@ -36,3 +39,4 @@ graph TD
 | ------ | ------------------------------------------------------------ | -------- |
 | TSK-95 | stack library: types, config, registry, runner, node+golang  | [x] DONE |
 | TSK-96 | `gennady verify` command, verify.sh delegation, docs, skills | [x] DONE |
+| TSK-97 | android plugin: detect + verify + sandboxLinks + invariants  | [ ] TODO |
