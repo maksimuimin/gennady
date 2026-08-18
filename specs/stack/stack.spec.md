@@ -27,8 +27,8 @@ _Каждый термин ниже используется всеми спек
 
 | Term                    | Definition                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Stack**               | Технологический стек репозитория, определяемый маркер-файлом в корне: `node` (`package.json`), `golang` (`go.mod`). Репозиторий может принадлежать нескольким стекам одновременно.                                                                                                                                                                                                                                                                                                                                               |
-| **StackPlugin**         | Реализация интерфейса §4 для одного стека: детекция + фасет `verify` (обязательный) + опциональные фасеты. Встроенные: `node`, `golang`.                                                                                                                                                                                                                                                                                                                                                                                         |
+| **Stack**               | Технологический стек репозитория, определяемый маркер-файлом в корне: `node` (`package.json`), `golang` (`go.mod`), `android` (каноничная Gradle-раскладка: `settings.gradle{.kts}` + `build.gradle{.kts}` + `gradlew` + `gradle/wrapper/gradle-wrapper.jar` + `gradle/wrapper/gradle-wrapper.properties`; полный алгоритм — §3). Репозиторий может принадлежать нескольким стекам одновременно.                                                                                                                                                                                                                                                                                              |
+| **StackPlugin**         | Реализация интерфейса §4 для одного стека: детекция + фасет `verify` (обязательный) + опциональные фасеты. Встроенные: `node`, `golang`, `android`.                                                                                                                                                                                                                                                                                                                                                                                         |
 | **Capability**          | Фасет плагина, обслуживающий одну команду CLI. Обязательный: `verify`. Опциональные: `fix`, `testcov`, `dbc-lint`, `directives` (§4.3); их поддержка может различаться между плагинами.                                                                                                                                                                                                                                                                                                                                          |
 | **Gate**                | Одна верификационная команда с бинарным вердиктом: `argv` + `cwd` + `env` + `timeout` + контракт вывода. Гейт **наблюдает** — он никогда не изменяет рабочее дерево, и это принудительно: все гейты исполняются в реплике прогона (D-STACK-013). Исполняется без shell. Квалифицированное имя: `<stack>:<id>` (например `golang:build`).                                                                                                                                                                                         |
 | **Run replica**         | Эфемерная реплика рабочего дерева, **одна на прогон verify**: `git worktree` + незакоммиченные изменения + untracked-файлы, забейзлайненные локальным коммитом реплики; ignored-файлы намеренно не реплицируются — семантика fresh clone (D-STACK-012), кроме environment-ссылок плагина (`sandboxLinks`, например `node_modules`). Все исполняемые гейты работают внутри неё; пути реплики в выводе переписываются на реальные. Репозиторий без git/HEAD → гейты исполняются в реальном дереве + диагностика `UNSANDBOXED_RUN`. |
@@ -50,15 +50,57 @@ _Каждый термин ниже используется всеми спек
 
 Детекция определяет, какие плагины активны для репозитория. Алгоритм детерминирован и намеренно примитивен — **существования маркер-файла в корне достаточно**; для экзотических раскладок есть `stack.use`:
 
-1. **Кандидаты.** Реестр встроенных плагинов в фиксированном порядке: `[node, golang]`.
+1. **Кандидаты.** Реестр встроенных плагинов в фиксированном порядке: `[node, golang, android]`.
 2. **Ограничение `use`.** Если в конфиге задан `stack.use` — реестр сужается до перечисленных id. Неизвестный id → ошибка конфига (config.spec §4.1). CLI-флаг `--stack=<id>` действует как одноразовый `use`.
 3. **Опрос.** У каждого кандидата вызывается `detect(root)`:
    - `node`: существует файл `<root>/package.json`. Содержимое на детекцию не влияет: сломанный агентом JSON не должен «раздетектить» плагин — битый файл всплывёт диагностикой на этапе планирования гейтов.
-   - `golang`: существует файл `<root>/go.mod`. Поиска вглубь нет — overkill; для нестандартной раскладки оператор задаёт `use` и/или `--root`.
+   - `golang`: существует файл `<root>/go.mod`. Идти вглубь не нужно; для нестандартной раскладки оператор задаёт `use` и/или `--root`.
+   - `android`: канонический Gradle-проект (алгоритм §3.6). В отличие от `node`/`golang` детект составной — пять файлов wrapper'а обязательны все; отсутствие любого из них → плагин не активен (D-STACK-014).
 4. **Активные = все распознавшие.** Репозиторий может быть node и golang одновременно — оба плагина активны, их гейты объединяются в один прогон в порядке реестра.
 5. **Ноль активных** → `NO_STACK_DETECTED`, exit 5, с перечнем известных маркеров и подсказкой (`--root`, `stack.use`).
 
 Инварианты: `detect` не мутирует дерево; из процессов позволены только короткие probe-вызовы версий инструментов (например `golangci-lint version`, чтобы поймать version skew до прогона). Дополнительные обходы (например поиск вложенных `go.mod` для диагностики `NESTED_MODULES`) — информационные и на решение о детекции не влияют.
+
+### 3.6 Android detect
+
+Составной чек — все шаги обязательны, любой не прошедший → плагин не активен (не диагностика: D-STACK-014, «строго по букве интейка»).
+
+1. **Wrapper-файлы.** Все пять относительно `<root>` существуют:
+   - `settings.gradle` **или** `settings.gradle.kts`
+   - `build.gradle` **или** `build.gradle.kts`
+   - `gradlew`
+   - `gradle/wrapper/gradle-wrapper.jar`
+   - `gradle/wrapper/gradle-wrapper.properties`
+
+   Хотя бы один отсутствует → детект возвращает `null`. Отсутствующий `gradle-wrapper.jar` (корп-политика «нет бинарников в git») по умолчанию исключает проект из детекта; оператор перекрывает через `stack.use: [android]`.
+
+2. **Плагин в корневом `build.gradle{.kts}`.** Читаем `<root>/build.gradle.kts`; если `.kts` отсутствует — читаем `<root>/build.gradle` (правило выбора файла применяется одинаково в шагах 2 и 4). Задача — найти в файле вызов, применяющий AGP-плагин (`com.android.application` / `com.android.library`) в одной из двух форм — direct или alias. Алгоритм резолвинга alias-формы — единственный, описан в шаге 3.
+
+   - **Direct-форма:** совпадение `id("com.android.application")` / `id("com.android.library")` (Kotlin DSL) или `id 'com.android.application'` / `id 'com.android.library'` (Groovy DSL).
+   - **Alias-форма:** совпадение `alias(libs.plugins.<путь>)` для `<путь>`, соответствующего целевому id согласно шагу 3.
+
+3. **Alias resolver (D-STACK-018).** Единственный алгоритм резолвинга alias-формы; выполняется **сначала над TOML, затем над build.gradle{.kts}** (не наоборот). Если `<root>/gradle/libs.versions.toml` отсутствует — alias-форма не поддерживается, ограничиваемся direct-формой.
+
+   - **1)** Хэнд-парс регексом секции `[plugins]` файла TOML: собираем пары `<alias-name> → <plugin-id>` из строк вида `<alias-name> = { id = "<plugin-id>", … }` или `<alias-name> = "<plugin-id>:<version>"`.
+   - **2)** Фильтруем пары по `<plugin-id> == "com.android.application"` или `"com.android.library"`; берём `<alias-name>` (левая часть). Резолвинг — **по полю `id`**, не по имени alias'а: в реальных проектах имя alias'а гуляет (`agp`, `android-app`, `androidApplication`), только id канонично.
+   - **3)** Конвертируем `<alias-name>` в путь доступа Gradle DSL: заменяем каждый `-` и `_` на `.` (правило Gradle Version Catalog: TOML `android-application` → DSL `libs.plugins.android.application`; TOML `android_application` → тот же DSL-путь).
+   - **4)** Ищем в файле build.gradle{.kts} строку `alias(libs.plugins.<полученный-путь>)`. Совпадение → alias-форма подтверждена.
+
+4. **Fallback на подмодули (D-STACK-014).** Если пункт 2 не сработал в корневом файле, читаем `<root>/settings.gradle{.kts}` (правило выбора: `.kts` в приоритете, иначе `.gradle`) и извлекаем регексом `include(":<module>")` / `include ':<module>'` — список подмодулей. Для каждого (до первого совпадения, лимит **32 модуля**) повторяем пункт 2 для файла `<root>/<module>/build.gradle{.kts}` — правило выбора `.kts`/`.gradle` то же, что в шаге 2. Совпадение хоть в одном → детект успешен. Ловит каноничную multi-module раскладку AGP 8+: корневой `plugins { alias(libs.plugins.android.application) apply false }` + реальное применение в `:app`.
+
+   **Превышение лимита 32.** Если парсер `settings.gradle{.kts}` вернул ровно 32 модуля (полный обход не гарантирован — есть шанс, что плагин лежит в 33+-м), а плагин не найден ни в одном — детект возвращает `null` **и добавляет диагностику `ANDROID_MODULE_LIMIT_EXCEEDED`** с подсказкой `stack.use: [android]` + `--root=<путь-к-модулю-с-AGP>`. Это соответствует принципу §2: «Diagnostic никогда не игнорируется молча».
+
+5. **Optional Gradle-плагины для гейтов (`ktlintCheck` / `detekt` / `spotlessCheck`).** Детектируются **во всех прочитанных выше build.gradle{.kts}**: в single-module раскладке (AGP найден в корне шагом 2, шаг 4 не запускался) — только корневой файл; в multi-module раскладке (fallback шага 4 сработал) — корневой + файл-держатель AGP-плагина. Плагин считается подключённым, если хотя бы в одном из этих файлов найден соответствующий id (`org.jlleitschuh.gradle.ktlint`, `io.gitlab.arturbosch.detekt`, `com.diffplug.spotless`) — direct или alias-формой (тот же алгоритм что для AGP; см. правило TOML-повторного чтения ниже). Ловит стандартную раскладку: `apply false` в корне + `apply true` в submodule-держателе AGP.
+
+   **Уточнение «single-module».** Термин относится к **алгоритмической ветке детекта** (AGP найден шагом 2 в корне), а не к физической структуре Gradle-проекта. Репозиторий с корневым `id("com.android.application")` (direct-форма без `apply false`) и физическими submodule'ами (`:app`, `:core`) идёт по single-module-ветке — шаг 4 не выполняется, submodule-файлы не читаются. Optional-плагины, объявленные только в submodule'ах, в этом случае не детектируются автоматически (см. «Известное ограничение» ниже). Стандартная раскладка AGP 8+ (`apply false` в корне + `apply true` в submodule) идёт по multi-module-ветке, так что этот сценарий редок; при необходимости — `extraGates` в конфиге.
+
+   **TOML для alias-формы optional-плагинов.** Если `gradle/libs.versions.toml` уже был прочитан на шаге 3 — переиспользуем разобранный результат (map `<alias-name> → <plugin-id>`). Если шаг 3 не вызывался (AGP найден direct-формой на шаге 2, single-module) — читаем TOML один раз здесь по алгоритму шага 3 (отсутствие файла → alias-форма не поддерживается для optional-плагинов тоже, ограничиваемся direct-формой).
+
+   **Известное ограничение (не диагностика).** Область детекта — корневой + держатель AGP. Optional-плагин, объявленный только в третьем submodule (`:core`, `:feature/x`, …), **не будет детектирован автоматически**. Обход: оператор добавляет соответствующий гейт через `extraGates` в конфиге (config.spec §3.2). Полный обход всех submodule-файлов на детекте не делаем: I/O стоит N-modules × read × regex — цена не окупается редкостью случая (типичная раскладка держит линтер `apply false` в корне + `apply true` в держателе AGP; это ловится).
+
+6. **Возвращаемое.** `StackDetection` с `summary` (модуль-держатель плагина, файл где найдено, AGP-версия из `libs.versions.toml` если удалось прочитать) + `details` (список подмодулей, разрешённый alias, канонические пути wrapper-файлов, набор подключённых optional-плагинов из шага 5).
+
+**Что явно не делаем в v1** (D-STACK-017): version-skew probe AGP × JDK в `detect` — несовместимость всплывёт как FAIL/ENV_FAIL на первом гейте `assemble` (в отличие от golang, где `golangci-lint version` пробится в `detect`). Причина: probe требует `./gradlew --version` (Gradle daemon start ≈ 3–8 сек) — детект стал бы дорогим для каждого прогона, а окупаемость сомнительна (JDK ошибку Gradle сам печатает читаемо).
 
 ## 4. StackPlugin Interface
 
@@ -66,10 +108,11 @@ _Каждый термин ниже используется всеми спек
 
 ```ts
 type StackPlugin = {
-  /** Уникальный id плагина: 'node' | 'golang'. */
+  /** Уникальный id плагина: 'node' | 'golang' | 'android'. */
   readonly id: StackId;
 
-  /** Маркер-файл детекции (например `go.mod`) — все ростеры (help, ошибки) рендерятся из реестра. */
+  /** Маркер-файл детекции (например `go.mod`) — все ростеры (help, ошибки) рендерятся из реестра.
+   *  Для составных детектов (android — 5 файлов + плагин-чек) — репрезентативный файл, отображаемый в помощи (android → `settings.gradle{.kts}`). */
   readonly marker: string;
 
   /** Однострочное описание для help и ростеров. */
@@ -83,7 +126,9 @@ type StackPlugin = {
 
   /**
    * Ignored-пути (относительно root), symlink'уемые в реплику прогона:
-   * среда исполнения стека, не состояние дерева (node: node_modules). D-STACK-013.
+   * среда исполнения стека, не состояние дерева.
+   * node: `node_modules`; android: `.gradle`, `.kotlin` (config-cache + K2 incremental metadata,
+   * D-STACK-013 + D-STACK-016; `build/` НЕ включён — компиляция kotlin/java с нуля).
    */
   readonly sandboxLinks?: readonly string[];
 
@@ -145,7 +190,10 @@ type Gate = {
   label: string;
   /** Команда с аргументами; исполняется spawn'ом БЕЗ shell — без интерполяции и пайпов. */
   argv: readonly string[];
-  /** Рабочая директория гейта (абсолютная). */
+  /** Рабочая директория гейта (абсолютная, в координатах реального дерева).
+   *  Плагин заполняет `cwd` абсолютным путём **реального дерева** (root или его подкаталог).
+   *  Раннер пересчитывает `cwd` в координаты реплики перед `spawnSync`:
+   *  `<replica>/<relpath-от-git-корня-до-cwd>` (§8.2 «cwd инвариант»). */
   cwd: string;
   /** Переменные окружения, мержатся поверх process.env; из конфига — GateSpec.env. */
   env?: Readonly<Record<string, string>>;
@@ -218,7 +266,7 @@ v1 реализует команду `gennady fix` и fixer `golang:generate`; �
 | ID          | Requirement                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | FR-STACK-01 | `StackPlugin` — общий интерфейс стека: `id`, `detect`, обязательный фасет `verify`, опциональные фасеты (§4)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| FR-STACK-02 | Реестр встроенных плагинов `node`, `golang`; детекция по маркер-файлу в корне (§3); активны все распознавшие                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| FR-STACK-02 | Реестр встроенных плагинов `node`, `golang`, `android` (в этом порядке — D-STACK-014); детекция по маркер-файлу или составному чеку (§3); активны все распознавшие                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | FR-STACK-03 | `gennady verify` — стек-агностичная команда: детекция → скоуп → план → RUN-ALL прогон → отчёт; `--plan` показывает план, диагностику и провенанс конфига без запуска                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | FR-STACK-04 | Конфиг по [config.spec.md](./config/config.spec.md): deep-merge источников с per-key провенансом, `use`, per-plugin `skipGates` / `overrideGates` / `extraGates`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | FR-STACK-05 | Порядок применения конфига: план плагина → `overrideGates` → `skipGates` → `extraGates`. `overrideGates` и `extraGates` разделяют одну схему `GateSpec`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -231,6 +279,7 @@ v1 реализует команду `gennady fix` и fixer `golang:generate`; �
 | FR-STACK-12 | Невалидный конфиг (парсинг, неизвестный ключ, неверный тип, неизвестный id в `use`) **останавливает команду до исполнения** — exit 4 с перечнем ошибок (config.spec §4.1)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | FR-STACK-13 | `verify.sh` (skill `sdd-execute`) делегирует в `gennady verify`, если тот доступен (с capability-probe против старых установок); легаси npm-путь остаётся фоллбеком                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | FR-STACK-14 | Fixer'ы (§4.4): команда `gennady fix [id…]` исполняет fixer'ы плагинов и конфига в реальном дереве (последовательно, fail-fast, exit 0/1/4/5); v1 поставляет golang-fixer `generate`, остальные встроенные — post-v1                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| FR-STACK-15 | android-плагин: детект по §3.6 (5 wrapper-файлов + плагин `com.android.application`/`.library` в корневом `build.gradle{.kts}` напрямую или через alias из `libs.versions.toml`; fallback на подмодули из `settings.gradle{.kts}` до 32 модулей; превышение лимита → диагностика `ANDROID_MODULE_LIMIT_EXCEEDED`); гейты `assemble → lint → test` (базовые: `assembleDebug`, `lintDebug`, `testDebugUnitTest`) + опциональные `ktlintCheck` / `detekt` / `spotlessCheck`, планируемые исполняемыми, когда соответствующий Gradle-плагин подключён **хотя бы в одном из прочитанных детектом build.gradle{.kts}** (корневой + submodule-держатель AGP, §3.6 шаг 5), иначе — `skipped: <reason>`; скоуп репо-уровневый (Gradle-таск, D-STACK-006); `sandboxLinks: ['.gradle', '.kotlin']` (D-STACK-016); отсутствующий бинарь `./gradlew` или `gradle-wrapper.jar` — детект возвращает `null` (не диагностика, D-STACK-014); AGP × JDK skew не пробится в `detect` — ловим на `assemble` (D-STACK-017) |
 
 ## 6. Approved Golden DX Example
 
@@ -289,6 +338,25 @@ $ gennady verify
 $ gennady verify
 [verify] ALL_GATES_PASS (4/4) — node: npm scripts (type-check, lint:contracts, test, format:check)
 
+# --- android-репозиторий: тот же контракт, план из Gradle-тасок ---
+$ cd android/ && gennady verify --plan
+
+[verify] plan for /repo/android (stacks: android)
+  config:    gennady.yaml
+  module:    :app (plugin com.android.application via libs.plugins.android.application)
+  agp:       8.5.2 (from gradle/libs.versions.toml)
+  scope:     repo-level (Gradle task, D-STACK-006)
+
+  ▶️  android:assemble    [10m]  ./gradlew assembleDebug
+  ▶️  android:lint        [5m]   ./gradlew lintDebug
+  ▶️  android:test        [10m]  ./gradlew testDebugUnitTest
+  ⏭️  android:ktlint      skip — плагин ktlint не подключён
+  ⏭️  android:detekt      skip — плагин detekt не подключён
+  ⏭️  android:spotless    skip — плагин spotless не подключён
+
+$ gennady verify
+[verify] ALL_GATES_PASS (3/3) — android: 3 Gradle task(s) (assembleDebug, lintDebug, testDebugUnitTest)
+
 # --- явные цели и подмножества гейтов (квалифицированные имена: stack:gate) ---
 $ gennady verify internal/userapi
 $ gennady verify --all --skip=test              # 'test' во всех активных стеках
@@ -297,7 +365,7 @@ $ gennady verify --only=golang:build,golang:vet --json
 # --- не распознан ни один стек ---
 $ cd /tmp/empty && gennady verify
 [verify] NO_STACK_DETECTED: no stack plugin recognized /tmp/empty
-  known stacks: node (package.json), golang (go.mod)
+  known stacks: node (package.json), golang (go.mod), android (settings.gradle{.kts} + Gradle wrapper + AGP-плагин, §3.6)
   fix: run from a project root, pass --root=<path>, or declare stack.use in gennady.yaml
 # exit 5
 ```
@@ -333,7 +401,7 @@ stack:
 | `StackPlugin`                                  | Interface    | §4.1: `id`, `detect`, обязательный `verify`, опциональные фасеты                                           |
 | `StackVerifyCapability`                        | Interface    | Фасет verify: `resolveScope` + `planGates`                                                                 |
 | `StackFixCapability`                           | Interface    | Фасет fix (§4.4): `planFixers(detection, scope)` — встроенные fixer'ы плагина (v1: golang `generate`)      |
-| `StackId`                                      | Type         | `'node' \| 'golang'`                                                                                       |
+| `StackId`                                      | Type         | `'node' \| 'golang' \| 'android'`                                                                          |
 | `StackDetection`                               | Value Object | `stack`, `root`, `summary` (строки для `--plan`), `diagnostics`, `details` (per-plugin payload)            |
 | `StackDiagnostic`                              | Value Object | `code`, `message`, `fix`                                                                                   |
 | `ScopeRequest`                                 | Value Object | `mode` (`files`/`changed`/`all`), `targets`                                                                |
@@ -350,7 +418,7 @@ stack:
 | `pluginConfigOf`                               | Function     | Извлечение среза конфига одного плагина                                                                    |
 | `applyStackConfig`                             | Function     | Применение конфига к плану: `overrideGates` → `skipGates` → `extraGates` (FR-STACK-05)                     |
 | `detectStacks`                                 | Function     | Алгоритм §3                                                                                                |
-| `BUILTIN_STACK_PLUGINS`                        | Constant     | `[nodePlugin, golangPlugin]`                                                                               |
+| `BUILTIN_STACK_PLUGINS`                        | Constant     | `[nodePlugin, golangPlugin, androidPlugin]` (D-STACK-014)                                                  |
 | `createTreeReplica`                            | Function     | Реплика прогона (§2): worktree + baseline-коммит + `sandboxLinks`; `reset()` — сброс к baseline            |
 | `runVerify`                                    | Function     | RUN-ALL исполнение планов всех стеков без shell; per-gate timeout; классификация статусов                  |
 | `formatVerifyReport`                           | Function     | Отчёт: диагностики + скипы + отказы (усечение вывода) + summary при успехе                                 |
@@ -361,6 +429,11 @@ stack:
 | `detectGoProject`                              | Function     | Данные Go-репо: модуль, `go.work`, вендоринг, конфиг golangci, тулчейн, диагностики                        |
 | `resolveGoScope`                               | Function     | Скоуп: `files` / `changed` / `all`                                                                         |
 | `planGoGates`                                  | Function     | План гейтов Go: build → vet → fmt → lint → test                                                            |
+| `androidPlugin`                                | Service      | `StackPlugin` для Android/Gradle-репозиториев                                                              |
+| `detectAndroid`                                | Function     | Составной детект §3.6: wrapper-файлы → корневой `build.gradle{.kts}` → alias-резолвинг → fallback подмодулей |
+| `parseVersionCatalog`                          | Function     | Хэнд-парс `gradle/libs.versions.toml` секции `[plugins]`: возвращает map `alias → id` (D-STACK-018)         |
+| `parseSettingsGradle`                          | Function     | Хэнд-парс `settings.gradle{.kts}`: `include(…)` → список подмодулей (лимит 32)                             |
+| `planAndroidGates`                             | Function     | План Android: assembleDebug → lintDebug → testDebugUnitTest + опциональные ktlintCheck/detekt/spotlessCheck (D-STACK-015) |
 | `runFix`                                       | Command      | CLI `gennady fix [id…]` — fixer'ы в реальном дереве, fail-fast (FR-STACK-14)                               |
 | `run`                                          | Command      | CLI `gennady verify`                                                                                       |
 
@@ -380,7 +453,8 @@ stack:
 
 - Preconditions: каждый исполняемый гейт имеет непустой `argv[0]` и `timeoutMs > 0`.
 - Postconditions: RUN-ALL; SUPPRESS-ON-SUCCESS; `outputMeansFailure: true` + exit 0 + непустой stdout → `fail`; **реплика прогона** (§2): одна на прогон, создаётся лениво перед первым исполняемым гейтом (worktree + незакоммиченные + untracked, baseline-коммит; ignored не реплицируются, D-STACK-012; `sandboxLinks` активных плагинов symlink'уются), все гейты исполняются в ней с realpath-нормализованным маппингом cwd, пути реплики в выводе переписываются на реальные, реальное дерево байт-в-байт нетронуто; `sandbox: true` + непустой drift-статус после команды → `fail` со списком файлов; гейт **без** `sandbox` + непустой статус → `violation` со списком файлов; после любого грязного статуса реплика сбрасывается к baseline (`reset --hard` + `clean -fd`) до следующего гейта; репозиторий без git/HEAD → гейты исполняются в реальном дереве + диагностика `UNSANDBOXED_RUN`, а `sandbox: true`-гейт при этом → `env-fail`; превышение `timeoutMs` → `timeout`; любой сработавший `envFail`-предикат → `env-fail` + запрет менять код в отчёте, `hint` сработавшего предиката дописывается к выводу; `ok === true` ⇔ все исполненные гейты `pass`.
-- Invariants: `spawnSync(argv)` без shell; `gate.env` мержится поверх `process.env`; вывод отказа усечён с маркером и командой воспроизведения.
+- Invariants: `spawnSync(argv)` без shell; `gate.env` мержится поверх `process.env`; вывод отказа усечён с маркером и командой воспроизведения; **при `UNSANDBOXED_RUN` `sandboxLinks` активных плагинов игнорируются** — гейты исполняются в реальном дереве «как есть», раннер не создаёт и не переписывает symlink'и; ignored-каталоги реального дерева (`.gradle/`, `node_modules/`, …) используются как есть.
+- `cwd` инвариант: плагин заполняет `Gate.cwd` абсолютным путём **реального дерева** (root или его подкаталог; см. §4.2 комментарий поля) — плагин не знает пути реплики. **Раннер пересчитывает `cwd` в координаты реплики перед `spawnSync`**: определяет git-корень через `git rev-parse --show-toplevel`, вычисляет `<relpath> = relpath(gate.cwd, git-корень)`, подставляет `cwd = <replica>/<relpath>`. При работе из поддиректории git-корня (канонический мобильный монорепозиторий с `android/` в подпапке, D-STACK-010) реплика всё равно создаётся от git-корня; `cwd` внутри реплики соответствует ей же самой поддиректории. Пути реплики в выводе переписываются с учётом того же relpath.
 
 ### 8.3 Stack Config
 
@@ -406,11 +480,17 @@ services/stack/
     ├── node/
     │   ├── node-plugin.ts
     │   └── classify-npm-scripts.ts
-    └── golang/
-        ├── golang-plugin.ts
-        ├── golang-detect.logic.ts
-        ├── golang-scope.logic.ts
-        └── golang-plan.logic.ts
+    ├── golang/
+    │   ├── golang-plugin.ts
+    │   ├── golang-detect.logic.ts
+    │   ├── golang-scope.logic.ts
+    │   └── golang-plan.logic.ts
+    └── android/
+        ├── android-plugin.ts
+        ├── android-detect.logic.ts           # §3.6: wrapper-чек → root build.gradle → alias/fallback
+        ├── android-version-catalog.logic.ts  # хэнд-парс libs.versions.toml (D-STACK-018)
+        ├── android-settings.logic.ts         # хэнд-парс settings.gradle{.kts}: include(...) (лимит 32)
+        └── android-plan.logic.ts             # gates: assembleDebug → lintDebug → testDebugUnitTest + optional
 
 cli/cmd/verify/
 ├── index.ts
@@ -508,6 +588,42 @@ cli/cmd/fix/
 - **Why:** «Гейт не мутирует дерево» до сих пор соблюдался только дисциплиной планирования (gofmt -l, скрининг npm-скриптов) — конфиговый или встроенный гейт мог молча мутировать. Одна реплика на прогон делает контракт физическим свойством по измеренной цене: на монорепозитории 566MB / 20k файлов — создание ~3.9s + baseline 0.3s + teardown 1.4s **однократно** и ~0.2s `git status` на гейт (против ~6s × N при реплике на гейт). Мутация гейта без `sandbox: true` — отдельный статус `violation` (не FAIL по коду, не ENV_FAIL) со сбросом реплики к baseline, чтобы следующие гейты видели чистое дерево. Кэши инструментов content-addressed (GOCACHE, golangci-lint) — компиляция не оплачивается дважды. Среда исполнения стека, живущая в ignored-путях (node: `node_modules`), symlink'уется по декларации плагина `sandboxLinks` — это среда, не состояние дерева, D-STACK-012 не ослабляется (golang не декларирует ничего). Пути реплики в выводе гейтов переписываются на реальные — иначе агент правит файлы в испаряющейся директории. Побочный выигрыш: `sandbox` в GateSpec становится тривиальным — реплика уже есть, флаг лишь выбирает семантику drift-вердикта (паттерн «быстрый скоуп-дефолт + канонический прогон адресно через skipGates + --only»).
 - **Rejected alternatives:** реплика на каждый гейт (стоимость × число гейтов — измерено); доверять спеке без принуждения (нарушение обнаруживается только по факту порчи дерева); авто-symlink всех ignored-директорий (отменяет fresh-clone семантику D-STACK-012 для drift-гейтов); off-switch в конфиге (опциональное принуждение — не принуждение; fallback без git/HEAD покрывает честно застрявших).
 
+### D-STACK-014 — Android детект: строго по букве интейка (5 wrapper-файлов) + fallback на подмодули settings.gradle
+
+- **Status:** active
+- **Recorded:** session Discovery, stack refine — «добавляем поддержку Android»
+- **Why:** Оператор задал алгоритм детекта явно. Хотя бы один из пяти файлов wrapper'а отсутствует → плагин не активен, без диагностики (симметричный принцип golang: несуществующий `go.mod` = не Go-проект, а не «сломанный проект»). При этом каноничная multi-module Android-раскладка AGP 8+ держит плагин через `apply false` в корне, а реально применяет в `:app` — буква алгоритма «только корневой build.gradle» отсекла бы большинство современных проектов. Fallback: если корневой build.gradle не даёт совпадения, читаем `settings.gradle{.kts}` (уже обязателен), извлекаем `include(":module")`-подмодули и повторяем плагин-чек для их build.gradle{.kts} до первого совпадения. Лимит 32 модуля — жёсткая верхняя граница чтения per detect (I/O стоимости и защита от патологических setups). Реестр `[node, golang, android]` — новый плагин в конец: не сдвигает порядок существующих отчётов.
+- **Risk accepted:** проекты с отсутствующим `gradle-wrapper.jar` (корп-политика «нет бинарников в git») не детектятся автоматически — оператор чинит через `stack.use: [android]`. Приёмка: это редкий случай; хуже — тихая ошибочная детекция «Android без wrapper'а», когда `./gradlew` физически недоступен.
+- **Rejected alternatives:** детект только по корневому build.gradle без fallback (убил бы AGP 8+ multi-module — общий случай); детект + диагностика при отсутствующем wrapper.jar (полу-детект: плагин активен, гейты сразу ENV_FAIL на первом же вызове `./gradlew` — тот же результат, но с ложным ожиданием у оператора); реестр в алфавитном порядке `[android, golang, node]` (сдвиг порядка отчётов ломает существующие снимки и `--json`-контракты).
+
+### D-STACK-015 — Android verify план: гранулярно, симметрично golang
+
+- **Status:** active
+- **Recorded:** session Discovery, stack refine
+- **Why:** Идиоматический Gradle-канон — `./gradlew check` (агрегатор). Гранулярный план `assemble → lint → test` (базовые: `assembleDebug`, `lintDebug`, `testDebugUnitTest`) выбран для совпадения формы с golang (`build → vet → fmt → lint → test`): каждый гейт отдельно репортит exit и вывод, `--only=android:lint` работает точечно, при падении assemble не запускаются lint/test с полезной ошибкой без прогонки Gradle-агрегатора целиком. Опциональные линтеры Kotlin (`ktlintCheck`, `detekt`, `spotlessCheck`) — гейты со `skipped: <reason>`, когда соответствующий Gradle-плагин не подключён (детект по plugin id в build.gradle{.kts}, уже прочитанном в §3.6); симметрично golang-`generate`, скипающемуся без `//go:generate`-директив. Мутирующие формы (`ktlintFormat`, `spotlessApply`) как гейты запрещены D-STACK-005 — их место в post-v1 фасете `fix`. Gradle daemon переиспользуется между тасками, так что 3–6 запусков стоят одну инициализацию, а не N.
+- **Rejected alternatives:** бандл `./gradlew check` (невозможен `--only=android:lint`, при падении приходится копать в выводе; ломает симметрию с golang/node); гибрид `assemble` + `check` (полу-симметрия — оператор гадает, где гранулярно, где бандлом); включить `connectedAndroidTest` (требует эмулятор/девайс — не для локального verify, ортогонально циклу SDD execute→verify).
+
+### D-STACK-016 — Android sandboxLinks = ['.gradle', '.kotlin']: уточнение D-STACK-013
+
+- **Status:** active
+- **Recorded:** session Discovery, stack refine — apply-false и «холодный Gradle»
+- **Why:** D-STACK-013 обязывает все гейты исполняться в реплике прогона, а `sandboxLinks` разрешает symlink только «среды исполнения стека, не состояния дерева». Для Android без `sandboxLinks` каждый `verify` = холодный Gradle = 5–15 мин на средний проект (config-cache пересчёт + компиляция kotlin/java с нуля) — инструмент неприменим для локальной итерации агента. `.gradle/` (config-cache + daemon-state) и `.kotlin/` (K2 incremental compiler metadata) — именно среда: они не хранят результаты компиляции, они кэшируют работу Gradle-configuration и Kotlin-compiler daemon'ов между прогонами. Пересборка одного и того же `settings.gradle` — та же работа, что переустановка `node_modules`: детерминирована и её результат не «состояние дерева». `build/` намеренно **не** включён: это и есть состояние дерева (промежуточные dex, R.java, .class), холодная сборка `build/` каждый прогон = fresh-clone-семантика для собственно артефактов. Компромисс между временем прогона и «чистотой»: config-cache и K2 daemon кэши — да, скомпилированный код — нет.
+- **Rejected alternatives:** линковка `.gradle` + `build` + `<module>/build` каждого подмодуля (агрессивно: линкуем все скомпилированные артефакты, отступление от D-STACK-012 без надобности — компиляция в тёплом daemon'е приемлема); ничего не линковать (5–15 мин холодной сборки каждый прогон — практически неприменимо, агент забьёт `--only` в бесконечном цикле); отдельный флаг `runInPlace` на GateSpec (pivot D-STACK-013: гейт вне реплики теряет sandbox-защиту от случайной мутации — цена выше, чем скорость).
+
+### D-STACK-017 — Android version-skew probe откладывается: ловим на assemble
+
+- **Status:** active
+- **Recorded:** session Discovery, stack refine
+- **Why:** Golang-плагин пробит `golangci-lint version` в `detect` (D-STACK-004 подкладка), чтобы поймать GOLANGCI_GO_TOO_OLD до прогона. Android аналог — `./gradlew --version` + AGP из `libs.versions.toml` + `java -version` — стоит 3–8 сек Gradle daemon start на каждый `detect`; окупаемость сомнительна: Gradle сам печатает ясное сообщение при несовместимости AGP × JDK на первом же `assemble`, а ложные тревоги (AGP запрашивает JDK 17, но проект собирается toolchain'ом на JDK 21 — легально) требуют парсинга `gradle/libs.versions.toml` toolchain-секции + `<repo>/.sdkmanrc`/`.jvmrc`. Первичная реализация плагина обходится без probe; когда/если жалобы «сборка падает без объяснения» накопятся — вернёмся к probe отдельной задачей.
+- **Rejected alternatives:** обязательный probe в `detect` (дорого + требует парсинга JDK-toolchain deep-семантики); опциональный probe за флагом (дефолтом всё равно off — те же условия что «не делаем»).
+
+### D-STACK-018 — libs.versions.toml alias: резолвинг по полю `id`, hand-parse
+
+- **Status:** active
+- **Recorded:** session Discovery, stack refine
+- **Why:** Оператор описал алгоритм на примере `android-application = { id = "com.android.application", version.ref = "gradle-plugin" }`, но имя alias'а в реальных проектах гуляет (`agp`, `android-app`, `androidApplication`). Резолвинг по фиксированным именам сломал бы проекты с нестандартными alias'ами. Правильная семантика Gradle Version Catalog — `id` каноничен, alias — просто имя переменной; ищем строку `id = "com.android.application"` (или `.library`) в секции `[plugins]`, берём имя alias'а (левая часть `=`), конвертируем `-`/`_` → `.` (правило Gradle: `android-application` в TOML → `libs.plugins.android.application` в Kotlin/Groovy DSL). Хэнд-парс регексом вместо npm-пакета TOML: формат Version Catalog узкий и стабильный, добавление рантайм-пакета противоречит духу zero-runtime-deps (spec vision); `classify-npm-scripts.ts` — прецедент хэнд-парса под конкретную задачу.
+- **Rejected alternatives:** захардкодить `android-application` / `android-library` (буква интейка, но ломает `agp` / `android-app` и т. п.); npm-пакет TOML-парсер (`@iarna/toml`, `smol-toml`) — новый рантайм-dep ради узкой задачи (парсинг двух-трёх строк в одной секции).
+
 ## 11. Inter-Module Dependencies
 
 - **Depends on:** `shared/backend/rc/rc-config.ts` (личный `.gennadyrc`), `shared/common/parse-args.ts`
@@ -516,6 +632,17 @@ cli/cmd/fix/
 ## 12. Handoff to Task Scaffolding
 
 - **Tasks (v1, mandatory capability):** TSK-95 (библиотека: types, config, registry, runner, plugins node+golang), TSK-96 (CLI `verify` + `verify.sh` делегация + документация)
+- **Tasks (android refine):** новая задача — `services/stack/plugins/android/*` (detect §3.6, alias-парсер, settings-парсер, plan §D-STACK-015, `sandboxLinks` §D-STACK-016), расширение `StackId`, регистрация в `BUILTIN_STACK_PLUGINS`, unit-тесты (real-runtime `unit`):
+  - каноничная multi-module раскладка (плагин через alias в `:app`, ktlint `apply false` в корне) → detect success, `android:ktlint` executable
+  - single-module ветка (AGP direct-формой в корне, ktlint alias-формой через `libs.versions.toml`) → detect success, `android:ktlint` executable — наблюдаемая проверка TOML-чтения на пути шага 5
+  - single-module ветка, TOML отсутствует, ktlint direct-формой в корне → `android:ktlint` executable; без ktlint → skipped (direct-форма работает без TOML)
+  - single-module ветка (AGP direct-формой в корне) + ktlint объявлен **только** в `:app/build.gradle.kts` → `android:ktlint` skipped — задокументированное ограничение §3.6 шаг 5 «Уточнение single-module»: шаг 4 не запускается при успехе шага 2, submodule-файлы не читаются
+  - отсутствующий `gradle-wrapper.jar` → `detect` возвращает `null`, никакой диагностики (D-STACK-014)
+  - `libs.versions.toml` с нестандартным alias-именем (`agp`, `android-app`, `androidApplication`) → резолвинг по полю `id` находит все
+  - `parseSettingsGradle` на 33 include-модулях → возвращает 32 первых
+  - `detectAndroid` на 33 include, AGP не найден ни в одном из первых 32 → `null` + диагностика `ANDROID_MODULE_LIMIT_EXCEEDED` (§3.6 шаг 4)
+  - `runVerify` в поддиректории git-корня (реплика от git-корня, `cwd` гейта пересчитан в `<replica>/<relpath>`) — §8.2 `cwd` инвариант
+  - optional-плагин объявлен только в третьем submodule → не детектится (задокументированное ограничение §3.6 шаг 5)
 - **Post-v1 (optional capabilities, скаффолдятся отдельными задачами по §4.3):** фасет `fix` + команда `gennady fix` (§4.4); фасет `testcov`; фасет `dbc-lint`; фасет `directives` (§4.5); миграция `resolve-verify-commands` на план verify
 - **TODO (отложено без дизайна):** внешние плагины (D-STACK-001)
 - **Stack dependencies:** TypeScript → `ai/directives/coding/typescript-rules.xml`; node:test → `ai/directives/testing/node-test.xml`
