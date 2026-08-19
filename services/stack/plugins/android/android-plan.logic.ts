@@ -1,10 +1,59 @@
 // @file: Gate plan for Android/Gradle projects — assemble → lint → test + optional ktlint/detekt/spotless.
 // @consumers: android-plugin, stack-config (gate id list)
-// @tasks: TSK-97
+// @tasks: TSK-97, TSK-98
 
-import type { Gate, GatePlanOptions } from '../../stack.types.ts';
+import type { EnvFailPredicate, Gate, GatePlanOptions } from '../../stack.types.ts';
+import { outputMatches } from '../../gate-runner.ts';
 import { parseDuration } from '../../stack-config.ts';
 import type { AndroidProject } from './android-detect.logic.ts';
+
+// #region START_ENV_FAIL_PREDICATES — D-STACK-019: env-fail on typical mobile env conditions
+
+const JDK_SKEW_RE = /Unsupported class file major version|requires Java \d+ to run|Minimum supported Gradle version is/;
+
+const DAEMON_CRASH_RE = /Gradle build daemon disappeared|The daemon has stopped unexpectedly/;
+
+const REGISTRY_BLOCKED_RE = /Could not (?:resolve|GET|download|find)|dial tcp.*(?:i\/o timeout|no such host|connection refused)|Received status code 4\d\d/;
+
+const KOTLIN_COMPILER_CRASH_RE = /KotlinFrontEndException|Internal compiler error/;
+
+/** Predicates for assemble/lint/ktlint/detekt/spotless — tool env failures, not code (D-STACK-019). */
+const ANDROID_TOOL_ENV_FAIL: readonly EnvFailPredicate[] = [
+  outputMatches(
+    JDK_SKEW_RE,
+    'JDK incompatible with AGP/Gradle — install a compatible JDK or set toolchain in build.gradle{.kts}',
+  ),
+  outputMatches(
+    DAEMON_CRASH_RE,
+    'Gradle daemon crashed (JVM crash / OOM) — increase -Xmx in gradle.properties; do NOT edit source in response',
+  ),
+  outputMatches(
+    REGISTRY_BLOCKED_RE,
+    'Maven/Gradle registry unreachable — unblock corporate proxy, or skip via stack.android.skipGates',
+  ),
+  outputMatches(
+    KOTLIN_COMPILER_CRASH_RE,
+    'Kotlin compiler panic — this is a toolchain bug, not source code; upgrade Kotlin or report to JetBrains',
+  ),
+];
+
+/** Predicates for test — same as tool, minus compiler-panic (test-code AssertionError is genuine FAIL, D-STACK-019). */
+const ANDROID_TEST_ENV_FAIL: readonly EnvFailPredicate[] = [
+  outputMatches(
+    JDK_SKEW_RE,
+    'JDK incompatible with AGP/Gradle — install a compatible JDK or set toolchain in build.gradle{.kts}',
+  ),
+  outputMatches(
+    DAEMON_CRASH_RE,
+    'Gradle daemon crashed (JVM crash / OOM) — increase -Xmx in gradle.properties; do NOT edit source in response',
+  ),
+  outputMatches(
+    REGISTRY_BLOCKED_RE,
+    'Maven/Gradle registry unreachable — unblock corporate proxy, or skip via stack.android.skipGates',
+  ),
+];
+
+// #endregion END_ENV_FAIL_PREDICATES
 
 /** Identifier of a built-in android gate. */
 export type AndroidGateId = 'assemble' | 'lint' | 'test' | 'ktlint' | 'detekt' | 'spotless';
@@ -81,8 +130,8 @@ function resolveTimeout(id: AndroidGateId, options: GatePlanOptions): number {
 
 /**
  * @purpose Plan the android gate list for a detected project.
- * @invariant Base gates always executable; optional gates skipped when plugin absent (§3.6 step 5);
- *   all gates: positive `timeoutMs`, `sandbox: false`, no `envFail` (D-STACK-017).
+ * @invariant Base executable; optional skipped when plugin absent (§3.6 step 5);
+ *   envFail per D-STACK-019 (TEST subset on test); skipped gates carry no envFail.
  * @param project Detected project — `optionalPlugins` drives skip reasons.
  * @param options Planning options; consulted for per-gate timeout overrides.
  * @returns Ordered gate plan.
@@ -101,6 +150,7 @@ export function planAndroidGates(project: AndroidProject, options: GatePlanOptio
       timeoutMs: resolveTimeout(id, options),
       outputMeansFailure: false,
       sandbox: false,
+      envFail: id === 'test' ? ANDROID_TEST_ENV_FAIL : ANDROID_TOOL_ENV_FAIL,
       skipped: null,
     });
   }
@@ -119,6 +169,7 @@ export function planAndroidGates(project: AndroidProject, options: GatePlanOptio
       timeoutMs: resolveTimeout(id, options),
       outputMeansFailure: false,
       sandbox: false,
+      envFail: present ? ANDROID_TOOL_ENV_FAIL : undefined,
       skipped: present ? null : `плагин ${key} не подключён`,
     });
   }

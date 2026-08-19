@@ -1,6 +1,6 @@
-// @file: Unit tests for planAndroidGates — gate ordering, optional skips, timeouts, scope.
+// @file: Unit tests for planAndroidGates — gate ordering, optional skips, timeouts, scope, envFail.
 // @consumers: CI
-// @tasks: TSK-97
+// @tasks: TSK-97, TSK-98
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -124,3 +124,85 @@ describe('planAndroidGates', () => {
     assert.ok(gates.find((g) => g.id === 'test')?.argv.includes('testDebugUnitTest'));
   });
 });
+
+// #region START_ENV_FAIL_SUITE — TSK-98 D-STACK-019
+describe('planAndroidGates — envFail predicates (TSK-98, D-STACK-019)', () => {
+  it('classifies "Unsupported class file major version" as env-fail on assemble (JDK/AGP skew)', () => {
+    const gate = planAndroidGates(project(), defaultOptions).find((g) => g.id === 'assemble')!;
+    const output = 'Unsupported class file major version 65\n';
+
+    const matched = (gate.envFail ?? []).some((pred) => pred(1, output));
+    assert.equal(matched, true);
+  });
+
+  it('classifies "Could not resolve" as env-fail on lint (blocked Maven proxy)', () => {
+    const gate = planAndroidGates(project(), defaultOptions).find((g) => g.id === 'lint')!;
+    const output = "Could not resolve com.android.tools:desugar_jdk_libs:2.0.0\n";
+
+    const matched = (gate.envFail ?? []).some((pred) => pred(1, output));
+    assert.equal(matched, true);
+  });
+
+  it('does NOT classify AssertionError under test as env-fail (genuine FAIL)', () => {
+    const gate = planAndroidGates(project(), defaultOptions).find((g) => g.id === 'test')!;
+    const output = 'AssertionError: expected "Ada" but got "Grace"\n';
+
+    const matched = (gate.envFail ?? []).some((pred) => pred(1, output));
+    assert.equal(matched, false);
+  });
+
+  it('classifies KotlinFrontEndException on assemble as env-fail (compiler panic)', () => {
+    const gate = planAndroidGates(project(), defaultOptions).find((g) => g.id === 'assemble')!;
+    const output = 'org.jetbrains.kotlin.util.KotlinFrontEndException: Internal compiler error\n';
+
+    const matched = (gate.envFail ?? []).some((pred) => pred(1, output));
+    assert.equal(matched, true);
+  });
+
+  it('does NOT classify KotlinFrontEndException under test as env-fail (test-code panic is FAIL)', () => {
+    const gate = planAndroidGates(project(), defaultOptions).find((g) => g.id === 'test')!;
+    const output = 'org.jetbrains.kotlin.util.KotlinFrontEndException: something\n';
+
+    const matched = (gate.envFail ?? []).some((pred) => pred(1, output));
+    assert.equal(matched, false);
+  });
+
+  it('classifies "Gradle build daemon disappeared" as env-fail on assemble', () => {
+    const gate = planAndroidGates(project(), defaultOptions).find((g) => g.id === 'assemble')!;
+    const output = 'Gradle build daemon disappeared unexpectedly (it may have been killed or may have crashed)\n';
+
+    const matched = (gate.envFail ?? []).some((pred) => pred(137, output));
+    assert.equal(matched, true);
+  });
+
+  it('classifies "Received status code 403" as env-fail on assemble', () => {
+    const gate = planAndroidGates(project(), defaultOptions).find((g) => g.id === 'assemble')!;
+    const output = "Received status code 403 from server: Forbidden\n";
+
+    const matched = (gate.envFail ?? []).some((pred) => pred(1, output));
+    assert.equal(matched, true);
+  });
+
+  it('classifies "requires Java 17 to run" as env-fail on lint', () => {
+    const gate = planAndroidGates(project(), defaultOptions).find((g) => g.id === 'lint')!;
+    const output = 'Gradle 8.4 requires Java 17 to run. You are currently using Java 11.\n';
+
+    const matched = (gate.envFail ?? []).some((pred) => pred(1, output));
+    assert.equal(matched, true);
+  });
+
+  it('optional executable gate (ktlint present) carries envFail; skipped optional gate does not', () => {
+    const gates = planAndroidGates(
+      project({ optionalPlugins: { ktlint: true, detekt: false, spotless: false } }),
+      defaultOptions,
+    );
+    const ktlint = gates.find((g) => g.id === 'ktlint')!;
+    const detekt = gates.find((g) => g.id === 'detekt')!;
+
+    assert.equal(ktlint.skipped, null);
+    assert.ok((ktlint.envFail ?? []).length > 0, 'executable ktlint must carry envFail');
+    assert.equal(detekt.skipped !== null, true);
+    assert.equal(detekt.envFail ?? undefined, undefined, 'skipped detekt must not carry envFail');
+  });
+});
+// #endregion END_ENV_FAIL_SUITE
