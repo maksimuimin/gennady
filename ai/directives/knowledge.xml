@@ -67,6 +67,15 @@
         <CheckPhase>typecheck</CheckPhase>
         <RequiresVerification>check-command</RequiresVerification>
       </Rule>
+      <Rule id="kotlin-rules">
+        <File>ai/directives/coding/kotlin-rules.xml</File>
+        <Purpose>Writing Kotlin (Android baseline; Kotlin/JVM subset): null-safety, immutability, scope-function intent, sealed exhaustiveness, structured coroutines, KDoc contract. Logging discipline lives in project-level rules; DI and Jetpack Compose in separate rule files layered on top.</Purpose>
+        <Triggers>Target Files are `.kt` or `.kts` source files (not Gradle build scripts)</Triggers>
+        <SkipWhen>Config-only task; Gradle build script task; infra-setup task without Kotlin source</SkipWhen>
+        <ActivationHint>Before editing or creating any `.kt` / `.kts` source file. Reads well alongside project-level logging rule when adopted.</ActivationHint>
+        <CheckPhase>typecheck</CheckPhase>
+        <RequiresVerification>check-command</RequiresVerification>
+      </Rule>
       <Rule id="svelte5-runes">
         <File>ai/directives/coding/svelte5-runes.xml</File>
         <Purpose>Writing Svelte 5 components with runes ($state, $derived, $effect, $props, $bindable). Inherits typescript-rules; adds Svelte-specific reactivity, template syntax, component structure. Prevents React-pattern code in .svelte files.</Purpose>
