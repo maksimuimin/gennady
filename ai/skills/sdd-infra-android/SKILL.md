@@ -9,7 +9,7 @@ compatibility: opencode
 
 Android specialisation of `sdd-infra`. Scope-type is fixed: `infrastructure`; language is fixed: `kotlin` (Android platform).
 
-The deterministic half of this skill is the stack plugin system — **one verb for every stack**: `gennady verify`. The android plugin carries the Gradle knowledge; the repo's deviations live in `gennady.yaml` (section `stack.android`; personal `.gennadyrc` files deep-merge on top), never in ad-hoc per-repo commands. Read `ai/directives/infra/android-setup.xml` for the reasoning behind every rule below, and `ai/directives/coding/kotlin-rules.xml` for the Kotlin source baseline layered on top.
+The deterministic half of this skill is the stack plugin system — **one verb for every stack**: `gennady verify`. The android plugin carries the Gradle knowledge; the repo's deviations live in `gennady.yaml` (section `stack.android`; personal `.gennadyrc` files deep-merge on top), never in ad-hoc per-repo commands. Read `ai/directives/infra/android-setup.xml` for the reasoning behind every rule below. The Kotlin source cascade layered on top of infra: `ai/directives/coding/kotlin-rules.xml` (language baseline) → `ai/directives/coding/kotlin-coroutines.xml` (activate for files touching `suspend` / `Flow`) → `ai/directives/coding/compose-rules.xml` (activate for `@Composable` files).
 
 ## 1. Orient before designing
 
@@ -117,7 +117,7 @@ Full reasoning in `ai/directives/infra/android-setup.xml`; the short form:
 When the operator wants tooling *designed* rather than merely run:
 
 1. **Extract intent.** Confirm scope-type=`infrastructure`, language=`kotlin` (Android platform). Resolve the scope name (e.g. `infra-android`).
-2. **Load & activate.** Read in full: `~/Developer/gennady/ai/directives/sdd/discovery.directive.xml`, then `~/Developer/gennady/ai/directives/infra/android-setup.xml`, then `~/Developer/gennady/ai/directives/coding/kotlin-rules.xml` (Kotlin source baseline layered on top of infra).
+2. **Load & activate.** Read in full: `~/Developer/gennady/ai/directives/sdd/discovery.directive.xml`, then `~/Developer/gennady/ai/directives/infra/android-setup.xml`, then `~/Developer/gennady/ai/directives/coding/kotlin-rules.xml` (Kotlin source baseline). If the scope will touch `suspend` / `Flow` / coroutine builders, also load `~/Developer/gennady/ai/directives/coding/kotlin-coroutines.xml`. If the scope will emit Compose UI, also load `~/Developer/gennady/ai/directives/coding/compose-rules.xml`.
    Announce: `🔒 DIRECTIVE ACTIVATED: SddDiscovery | infrastructure | android`
 3. **Ground every requirement in observed state** — the `--plan --json` output above, not assumptions about how Android projects usually look (single-module vs multi-module AGP 8+ is a real fork, §3.6 in stack.spec.md).
 4. **Apply.** Follow the discovery Execution_Plan end-to-end. Every proposed gate must be expressible as a `gennady verify` invocation or a `gennady.yaml` entry — or justified as to why it is not.

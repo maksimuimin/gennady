@@ -69,14 +69,41 @@
       </Rule>
       <Rule id="kotlin-rules">
         <File>ai/directives/coding/kotlin-rules.xml</File>
-        <Purpose>Writing Kotlin (Android baseline; Kotlin/JVM subset): null-safety, immutability, scope-function intent, sealed exhaustiveness, structured coroutines, KDoc contract. Logging discipline lives in project-level rules; DI and Jetpack Compose in separate rule files layered on top.</Purpose>
+        <Purpose>Writing Kotlin (Android baseline; Kotlin/JVM subset): null-safety, immutability, scope-function intent, sealed exhaustiveness, KDoc contract, structural anchors. Coroutines and Compose live in dedicated child directives layered on top.</Purpose>
         <Triggers>Target Files are `.kt` or `.kts` source files (not Gradle build scripts)</Triggers>
         <SkipWhen>Config-only task; Gradle build script task; infra-setup task without Kotlin source</SkipWhen>
         <ActivationHint>Before editing or creating any `.kt` / `.kts` source file. Reads well alongside project-level logging rule when adopted.</ActivationHint>
         <CheckPhase>typecheck</CheckPhase>
         <RequiresVerification>check-command</RequiresVerification>
+        <CrossRef id="kotlin-coroutines">Child directive: activate on top when the file imports `kotlinx.coroutines.*` or uses `suspend`.</CrossRef>
+        <CrossRef id="compose-rules">Child directive: activate on top when the file contains `@Composable`.</CrossRef>
         <CrossRef id="android-setup">Companion infra directive: Gradle wrapper, gates via gennady verify, ENV_FAIL contract for JDK/AGP skew.</CrossRef>
         <CrossRef id="android-testing">Testing directive layered on top for `.kt` under `src/test/**` / `src/androidTest/**`.</CrossRef>
+      </Rule>
+      <Rule id="kotlin-coroutines">
+        <File>ai/directives/coding/kotlin-coroutines.xml</File>
+        <Purpose>Writing `kotlinx.coroutines` and `kotlinx.coroutines.flow` code: structured concurrency, dispatcher discipline + injection, scope lifecycle ownership, timeouts, `Mutex` / `Semaphore`, `Flow` / `SharedFlow` / `StateFlow`, `callbackFlow` cleanup, coroutine testing (`runTest`, `TestDispatcher`). Inherits `kotlin-rules` for KDoc contract, anchors, Trace-Prefix, and `AX_CATCH_WRAP_RETHROW`.</Purpose>
+        <Triggers>Target Files import `kotlinx.coroutines.*` · define or call `suspend` functions · build `Flow` / `SharedFlow` / `StateFlow` · touch `CoroutineScope` / `Job` / `Deferred` · use `runTest` / `TestDispatcher`</Triggers>
+        <SkipWhen>Pure synchronous Kotlin (no `suspend`, no coroutine imports, no `Flow`) · Config-only task · Gradle build script task</SkipWhen>
+        <ActivationHint>Before editing any file that touches suspend / coroutines / Flow. Inherits from kotlin-rules — read both.</ActivationHint>
+        <CheckPhase>typecheck</CheckPhase>
+        <RequiresVerification>check-command</RequiresVerification>
+        <CrossRef id="kotlin-rules">Parent directive: inherits all baseline Kotlin rules.</CrossRef>
+        <CrossRef id="compose-rules">Compose side-effect entries (`LaunchedEffect`, `rememberCoroutineScope`, `produceState`, `snapshotFlow`, `collectAsStateWithLifecycle`) inherit this directive's discipline.</CrossRef>
+        <CrossRef id="android-testing">Testing directive covers JUnit setup for `runTest` + `Dispatchers.setMain`.</CrossRef>
+      </Rule>
+      <Rule id="compose-rules">
+        <File>ai/directives/coding/compose-rules.xml</File>
+        <Purpose>Writing Jetpack Compose UI: composable purity (restartable, skippable, idempotent), state hoisting, `remember` / `rememberSaveable` discipline, side-effect entries (`LaunchedEffect`, `DisposableEffect`, `SideEffect`, `rememberCoroutineScope`, `produceState`, `snapshotFlow`), recomposition stability (`@Stable`, `@Immutable`, `ImmutableList`, `derivedStateOf`), `Modifier` chain conventions, `CompositionLocal` discipline, `LazyColumn` keys, `@Preview` coverage, Compose UI testing (`ComposeTestRule`, semantic queries). Inherits `kotlin-rules` and `kotlin-coroutines`.</Purpose>
+        <Triggers>Target Files contain `@Composable` annotation · define UI-emitting composables · touch `Modifier` chains · use Compose side-effect APIs · Compose UI test files</Triggers>
+        <SkipWhen>Non-Compose Kotlin file · pure business logic without UI · Compose Multiplatform desktop / iOS specifics (project-level directive) · Wear OS Compose (separate directive)</SkipWhen>
+        <ActivationHint>Before editing any file containing `@Composable`. Inherits from kotlin-coroutines transitively — read kotlin-rules + kotlin-coroutines + compose-rules.</ActivationHint>
+        <CheckPhase>typecheck</CheckPhase>
+        <RequiresVerification>check-command</RequiresVerification>
+        <CrossRef id="kotlin-rules">Transitive parent: inherits baseline Kotlin rules.</CrossRef>
+        <CrossRef id="kotlin-coroutines">Direct parent: Compose side-effect entries inherit its structured-concurrency and Flow discipline.</CrossRef>
+        <CrossRef id="android-testing">Compose UI tests build on JUnit4/JUnit5 base.</CrossRef>
+        <CrossRef id="android-setup">Compose compiler plugin activation + stability-report configuration lives in Gradle infra.</CrossRef>
       </Rule>
       <Rule id="svelte5-runes">
         <File>ai/directives/coding/svelte5-runes.xml</File>
@@ -171,6 +198,8 @@
         <RequiresVerification>check-command</RequiresVerification>
         <CrossRef id="testing-common">Parent directive: read first for case flow, anchors, unified context, BDD mapping.</CrossRef>
         <CrossRef id="kotlin-rules">Kotlin source rules apply to test files too (null-safety, sealed exhaustiveness, KDoc).</CrossRef>
+        <CrossRef id="kotlin-coroutines">Coroutine tests use `runTest` + `TestDispatcher` per its `AX_COROUTINE_TESTING`.</CrossRef>
+        <CrossRef id="compose-rules">Compose UI tests inherit its testing rules (`ComposeTestRule`, semantic queries).</CrossRef>
         <CrossRef id="android-setup">Companion infra directive: gates via gennady verify, `testDebugUnitTest` semantics, `connectedAndroidTest` out-of-loop.</CrossRef>
       </Rule>
       <Rule id="svelte-testing">
@@ -223,6 +252,8 @@
         <CheckPhase>test</CheckPhase>
         <RequiresVerification>check-command</RequiresVerification>
         <CrossRef id="kotlin-rules">Kotlin source rules layered on top for `.kt`/`.kts` files.</CrossRef>
+        <CrossRef id="kotlin-coroutines">Coroutine rules layered on top for files touching `suspend` / `Flow`.</CrossRef>
+        <CrossRef id="compose-rules">Compose rules layered on top for files containing `@Composable`; Compose compiler plugin and stability reports configured here.</CrossRef>
         <CrossRef id="android-testing">Testing directive layered on top for `.kt` under `src/test/**` / `src/androidTest/**`.</CrossRef>
       </Rule>
       <Rule id="storybook-setup">

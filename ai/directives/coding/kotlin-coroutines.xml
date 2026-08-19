@@ -1,0 +1,468 @@
+<KotlinCoroutinesRules keywords="kotlin, coroutines, structured_concurrency, flow, stateflow, sharedflow, dispatcher, cancellation, supervisor, mutex, timeout, coroutinescope, coroutinecontext, ai_to_ai" type="coding-rules" ver="1.0">
+  <Mission>
+    Baseline rules for `kotlinx.coroutines` and `kotlinx.coroutines.flow` in every execution-agent. Layered on top of `kotlin-rules` — inherits its KDoc contract, anchor grammar, `AX_CATCH_WRAP_RETHROW`, and Trace-Prefix discipline; adds only concurrency-specific enforcement.
+
+    Extracted from `kotlin-rules.xml` v1.0 (axioms `AX_COROUTINES_STRUCTURED` and `AX_FLOW_DISCIPLINE`, pattern `PT_STRUCTURED_COROUTINE`, anti-pattern `AP_GLOBAL_SCOPE_RUNBLOCKING`) to make concurrency load-and-activate discretely — a task touching pure sync Kotlin does not pay the coroutines context cost, and a task touching a coroutine boundary loads a single focused rule surface.
+
+    Scope: `suspend` functions, coroutine builders (`launch`, `async`, `runBlocking`, `flow`, `callbackFlow`, `channelFlow`), scopes (`CoroutineScope`, `viewModelScope`, `lifecycleScope`, `supervisorScope`, `coroutineScope`), dispatchers (`Dispatchers.IO` / `Default` / `Main` / `Main.immediate` / `Unconfined`), synchronization primitives (`Mutex`, `Semaphore`, `Channel`, `select`), timeouts (`withTimeout` / `withTimeoutOrNull`), and testing coroutines (`kotlinx-coroutines-test`: `runTest`, `TestDispatcher`, `TestScope`).
+
+    Out of scope: Compose-specific side-effect coroutine surfaces (`LaunchedEffect`, `rememberCoroutineScope`, `produceState`, `snapshotFlow`) — see `compose-rules`. Reactive-stream interop (`reactor` / `rxjava` bridges) is out of scope; introduce a dedicated directive if the project adopts one.
+
+    Sources (public standards): JetBrains coroutines guide (kotlinlang.org/docs/coroutines-guide.html), Flow guide (kotlinlang.org/docs/flow.html), Android best practices for coroutines (developer.android.com/kotlin/coroutines/coroutines-best-practices), Roman Elizarov «Structured concurrency» series. Adopted as timeless engineering practice; version numbers and lib coordinates omitted.
+
+    **Base axiom:** structured concurrency is not a style preference — it is a runtime contract. A leaked coroutine, an orphaned `Deferred`, a swallowed `CancellationException`, or a producer that emits from the wrong dispatcher are silent bugs invisible to the type system. Every rule below closes one of those silent-bug classes.
+  </Mission>
+
+  <BeliefState>
+    <Axiom id="AX_COROUTINES_STRUCTURED">
+      Structured concurrency is mandatory. Enforced rules:
+      - `GlobalScope` is forbidden in production code — every coroutine belongs to a lexically-scoped `CoroutineScope` owned by a lifecycle (`viewModelScope`, `lifecycleScope`, an explicitly held scope with `SupervisorJob` + owned dispatcher).
+      - `runBlocking` is forbidden outside three permitted contexts: the JVM `main` entry point, tests (`kotlinx-coroutines-test` preferred — see `AX_COROUTINE_TESTING`), and CLI `main` scripts. Bridging between suspend and non-suspend code inside business logic uses `withContext` on the appropriate dispatcher, not `runBlocking`.
+      - Concurrent-independent branches (fan-out where one failure must not cancel siblings) use `supervisorScope` / a `CoroutineScope(SupervisorJob())`; concurrent-dependent branches (all-or-nothing) use `coroutineScope`.
+      - CPU-bound long-running loops without any `suspend` call in the body invoke `ensureActive()` at each iteration to cooperate with cancellation. Loops that already contain a `suspend` call per iteration (network, DB, `delay`, `yield`) do NOT need `ensureActive()` — the suspension point IS the cooperation point; adding `ensureActive()` there is dead code and a false «no suspension here» signal per `kotlin-rules` `AX_MINIMAL_ERROR_SURFACE`.
+      - `CancellationException` MUST propagate — never caught and swallowed. A `catch (e: Throwable)` that intends to handle only I/O errors MUST explicitly rethrow `CancellationException` first, or catch a narrower type. Wrapping `CancellationException` in a domain exception is forbidden — cooperative cancellation depends on the exception identity.
+      - `async` results (`Deferred`) MUST be `.await()`-ed within the same scope — an orphaned `Deferred` is a resource leak. If the intent is fire-and-forget on the same scope, use `launch`, not `async` with a discarded return.
+    </Axiom>
+
+    <Axiom id="AX_DISPATCHER_DISCIPLINE">
+      Dispatchers are explicit at every I/O and CPU-bound boundary. Rules:
+      - `withContext(Dispatchers.IO)` for blocking I/O (network, file, DB drivers without native suspend); `withContext(Dispatchers.Default)` for CPU-bound work (parsing, crypto, image processing).
+      - UI code (`Dispatchers.Main` / `Dispatchers.Main.immediate`) is entered only when writing to the UI surface. `Main.immediate` fast-paths when the caller is already on the main thread — prefer it for UI state emissions triggered from UI callbacks (avoids one dispatch trip).
+      - `Dispatchers.Unconfined` is forbidden in production code except inside operator implementations that provably preserve context — its resumption on an arbitrary thread breaks most reasoning about locality.
+      - **Dispatcher injection is the norm for testability.** Business-logic classes that switch context MUST accept the target dispatcher via constructor / factory parameter — never hard-code `Dispatchers.IO` inside a service body. This lets tests substitute `StandardTestDispatcher` / `UnconfinedTestDispatcher` per `AX_COROUTINE_TESTING`; a hard-coded dispatcher forces tests to `runBlocking` and defeats virtual time.
+      - The `Dispatchers.Main` binding on Android requires `kotlinx-coroutines-android`. On non-Android JVM tests the binding is missing by default; tests set a `TestDispatcher` via `Dispatchers.setMain(...)` in the setup and `Dispatchers.resetMain()` in the teardown — see `AX_COROUTINE_TESTING`.
+      - Document ownership per `kotlin-rules` `AX_ENTITY_SPECIFIC_MINIMUMS`: CALLER-required dispatcher → `@invariant Dispatcher: MUST be called on <Dispatchers.X>`; INTERNALLY-managed dispatcher → `@sideEffect Dispatch: <Dispatchers.X>`; dispatcher-agnostic → no tag.
+    </Axiom>
+
+    <Axiom id="AX_SCOPE_LIFECYCLE_OWNERSHIP">
+      Every explicit `CoroutineScope` created outside a lifecycle framework MUST be owned by a class whose lifecycle is well-defined and MUST be cancelled at end-of-life. Rules:
+      - Composition: `CoroutineScope(SupervisorJob() + <dispatcher> + CoroutineName("<scope-purpose>"))`. `SupervisorJob` isolates child failures; a plain `Job()` propagates one child's failure to all siblings and to the scope itself.
+      - Cancellation is not optional. Any class holding a scope declares a `close()` / `dispose()` / `onCleared()` (Android `ViewModel`) that calls `scope.cancel()`; missing cancellation leaks every launched coroutine plus its dispatcher-bound resources. Anchor the cancellation call in an `@invariant` naming the lifecycle event (`close`, `onCleared`, DI-container disposal).
+      - `CoroutineExceptionHandler` is installed on the ROOT `CoroutineScope` only — it fires for uncaught exceptions in `launch` children (never for `async`, whose exceptions surface at `.await()`). A handler on a nested `launch { }` is silently ignored. Use it for logging / crash reporting; never for control flow.
+      - `CoroutineName` is not a diagnostic ornament: it lands in stack traces and profiler UI, so name it after the scope's business role, not its class.
+    </Axiom>
+
+    <Axiom id="AX_TIMEOUT_DISCIPLINE">
+      Every network / IPC / external-process suspension MUST be bounded by an explicit timeout: `withTimeout(<duration>) { ... }` when a timeout is a hard failure (throws `TimeoutCancellationException`, a `CancellationException` subclass that is caught locally by `try` / `catch (t: TimeoutCancellationException)`), `withTimeoutOrNull(<duration>)` when the timeout has a domain-fallback value. A suspend call with no upstream timeout and no library-imposed timeout is a hang waiting to happen.
+      - `TimeoutCancellationException` is a `CancellationException` subclass — catching it does NOT violate `AX_COROUTINES_STRUCTURED` (that rule bans swallowing generic cancellation, not the timeout-specific subclass caught by narrowest type).
+      - Timeouts are expressed in `kotlin.time.Duration` (`5.seconds`, `500.milliseconds`), never as raw `Long` millis in business code — the raw form loses unit-of-measure and reads badly across call sites.
+      - Nested timeouts stack: an inner `withTimeout(10.seconds)` inside an outer `withTimeout(5.seconds)` still cancels at 5 s. Documented in `@invariant` when the nesting is intentional.
+    </Axiom>
+
+    <Axiom id="AX_SYNCHRONIZATION_PRIMITIVES">
+      Shared mutable state accessed from concurrent coroutines is protected by a `kotlinx.coroutines.sync.Mutex` (suspend-based, does NOT block the thread), NEVER by JVM `synchronized`, `ReentrantLock`, `AtomicReference` used as a lock, or ad-hoc `Volatile` fields. `synchronized` blocks a carrier thread and defeats coroutine dispatching — a coroutine holding a JVM lock across a suspension can dispatch onto a different thread and lose the lock's owner identity, producing an `IllegalMonitorStateException` on release.
+      - `Mutex.withLock { ... }` is the only allowed acquire form — direct `lock()` / `unlock()` pairs are refactor-hostile (a `throw` between them leaks the lock).
+      - Prefer confinement over locking: single-owner mutable state guarded by an actor (`Channel` + `launch`) or a `StateFlow`-backed reducer is easier to reason about than a `Mutex` around a shared object.
+      - `Semaphore` is the concurrency limiter (bound parallel I/O to N in-flight); document the bound in an `@invariant` on the property.
+      - `select { }` is used only for genuine multi-source race semantics (first-of-N channels); a `select` with a single clause is dead complexity — write `.receive()` directly.
+    </Axiom>
+
+    <Axiom id="AX_FLOW_DISCIPLINE">
+      `Flow` / `SharedFlow` / `StateFlow` are the canonical async-stream API and carry contracts that plain `suspend` functions do not. Enforced discipline:
+
+      - **Dispatcher placement.** Producer-side dispatcher is set on the flow with `.flowOn(Dispatchers.IO)` at the earliest point where the upstream work becomes blocking. NEVER wrap `flowOn` around the `collect` call — `flowOn` affects upstream, not downstream. Collection itself runs on the collector's context (`lifecycleScope` / `viewModelScope` in Android UI).
+      - **Collection scope.** Every `collect` / `collectLatest` MUST run inside a lifecycle-owned `CoroutineScope` (`viewModelScope`, `lifecycleScope`, an owned scope with `SupervisorJob`). NEVER collect from `GlobalScope`; NEVER collect inside a suspend function whose scope is unclear — pass the scope explicitly or accept the `Flow` and let the caller collect.
+      - **Android lifecycle collection.** In UI code prefer `flow.collectAsStateWithLifecycle()` (Compose) or `repeatOnLifecycle(Lifecycle.State.STARTED) { flow.collect { ... } }` (View system) over a bare `lifecycleScope.launch { flow.collect { ... } }` — the bare form keeps the collector active while the UI is in the background and burns battery on emissions no one will see.
+      - **`callbackFlow` cleanup.** A `callbackFlow { }` builder MUST end with `awaitClose { … }` that unregisters the callback / listener / subscription. Omitting `awaitClose` leaks the subscription past cancellation; the compiler will not warn.
+      - **Buffering bounds.** `SharedFlow(replay = N, extraBufferCapacity = M)` / `MutableStateFlow` with any non-default buffer requires an `@invariant` on the declaring property naming the upper bound and its rationale. An unbounded buffer (`BufferOverflow.SUSPEND` on an infinite hot producer) is forbidden without a documented back-pressure strategy — silent unbounded growth is a design-evident leak.
+      - **Hot vs cold intent.** `flow { }` is cold — every collector re-runs the producer; `StateFlow` / `SharedFlow` are hot — shared state / multicast. Convert cold→hot via `stateIn` / `shareIn` only with an explicit scope + `SharingStarted` policy; the policy IS the contract (`WhileSubscribed(5_000)` for UI, `Eagerly` for always-on caches, `Lazily` for start-on-first-collector) and MUST match the consumer lifecycle.
+      - **Terminal operators inside flow.** NEVER call `collect` / `toList` on another `Flow` inside a `flow { }` builder — this is a downstream operation smuggled into upstream and defeats laziness. To nest / merge another `Flow` into a producer, use `flatMapConcat` / `flatMapMerge` / `flatMapLatest` at the call site. `map` / `transform` are for element-by-element transformation, not for nesting a `collect`.
+      - **Error boundaries in producers.** I/O inside a `flow { }` / `callbackFlow { }` / `channelFlow { }` body that can fail MUST be wrapped per `kotlin-rules` `AX_CATCH_WRAP_RETHROW`. `CancellationException` is re-thrown as-is — a producer that catches `CancellationException` and swallows it breaks cooperative Flow cancellation. For downstream error handling (retry, fallback), prefer the operator `catch { }` (which explicitly does NOT catch `CancellationException`) at the collector side; use a `try / catch` inside the producer only when the recovery is producer-local.
+      - **`stateIn` / `shareIn` scope.** The `scope` passed to `stateIn` / `shareIn` MUST be a lifecycle-owned scope (`viewModelScope`, `lifecycleScope`, an explicit owned scope with `SupervisorJob`) — never `GlobalScope`, per `AX_COROUTINES_STRUCTURED`. `GlobalScope` on `stateIn` / `shareIn` creates a hot Flow that outlives every consumer and accumulates subscribers — design-evident leak.
+      - **`emit` context invariance.** Inside `flow { }`, `emit(x)` inside a `withContext(...)` block throws `IllegalStateException` (Flow's context-preservation invariant). Cold producers place the dispatcher via `.flowOn(...)` on the flow itself. `callbackFlow { }` / `channelFlow { }` builders use `send` / `trySend` on the underlying `ProducerScope` — `withContext` around them is fine; do not confuse the two APIs.
+    </Axiom>
+
+    <Axiom id="AX_SUSPEND_CONTRACT">
+      A `suspend` function is a contract: it MAY suspend, MUST cooperate with cancellation, and MUST NOT block the underlying thread. Rules:
+      - A `suspend` function that does no real suspension (no `withContext`, no `delay`, no `yield`, no library suspend call) is a lie — either drop the modifier or add the suspension point the name promises.
+      - Long-running blocking calls (JDBC, `Thread.sleep`, `File.readBytes` on large files) inside a `suspend` function MUST be wrapped in `withContext(Dispatchers.IO)` — running them on the caller's dispatcher blocks a carrier thread that other coroutines share.
+      - A `suspend` function MUST NOT expose a `Job` / `Deferred` / `Channel` in its return type as a workaround for «I want structured lifetime but can't figure out the scope» — return a value / `Flow` / `Result`, and let the caller pick the scope.
+      - Suspend + generic callback (`onSuccess`, `onError`) is a smell — convert to `Result` or throw + `try`/`catch`. Callbacks inside `suspend` bypass cancellation propagation.
+    </Axiom>
+
+    <Axiom id="AX_COROUTINE_TESTING">
+      Coroutines are tested with `kotlinx-coroutines-test` (`runTest`, `TestDispatcher`, `TestScope`, `advanceTimeBy`, `advanceUntilIdle`), never with production dispatchers or blocking `Thread.sleep`. Rules:
+      - Test bodies use `runTest { ... }`, not `runBlocking { ... }` — `runTest` provides virtual time (`delay(1.hours)` completes instantly if no real suspension intervenes) and eager error propagation.
+      - The system-under-test receives a `TestDispatcher` via constructor injection per `AX_DISPATCHER_DISCIPLINE`. `StandardTestDispatcher` requires manual `advanceUntilIdle()` between actions (models real dispatcher behaviour with a queue); `UnconfinedTestDispatcher` runs launched coroutines eagerly on the current thread (simplest for state-based assertions).
+      - Android `Dispatchers.Main` is rebound via `Dispatchers.setMain(testDispatcher)` in `@Before` and `Dispatchers.resetMain()` in `@After` (or the test-rule equivalent). Skipping the reset leaks state into the next test.
+      - Flows are asserted with `flow.test { … awaitItem() … }` (Turbine) or `flow.toList(mutableList).also { … }` inside `runTest`. `runBlocking` around a flow collection is forbidden — it hides real cancellation and time semantics.
+      - A test that spawns unresolved coroutines and returns MUST call `advanceUntilIdle()` before the assertion — otherwise the assertion runs against pre-launch state and passes trivially.
+    </Axiom>
+  </BeliefState>
+
+  <Definitions>
+    <Definition id="DEF_LIFECYCLE_OWNED_SCOPE">A `CoroutineScope` cancelled at a deterministic end-of-life event: `viewModelScope` (Android `ViewModel.onCleared`), `lifecycleScope` (Android lifecycle-owner DESTROYED), or an explicit `CoroutineScope(SupervisorJob() + dispatcher)` whose owner calls `scope.cancel()` in its `close()` / `dispose()`.</Definition>
+    <Definition id="DEF_STRUCTURED_FAILURE">A failure whose scope of effect is bounded by the surrounding builder — a `coroutineScope { }` cancels all children on any child failure and rethrows the first exception; a `supervisorScope { }` isolates the failure to the failing child. The chosen builder IS the failure policy.</Definition>
+    <Definition id="DEF_COLD_VS_HOT_FLOW">Cold: `flow { }` — producer re-runs per collector; no state. Hot: `StateFlow` (single value + replay=1), `SharedFlow` (multi-value, configurable replay + buffer) — shared across collectors. Conversion cold→hot: `stateIn` / `shareIn`.</Definition>
+  </Definitions>
+
+  <Patterns>
+    <Pattern id="PT_STRUCTURED_COROUTINE_FAN_OUT">
+      <Intent>Concurrent-independent fan-out: `supervisorScope` so one failure does not cancel siblings; explicit dispatcher; every `async` awaited within the same scope.</Intent>
+      <Snippet language="kotlin">
+        ```kotlin
+        // @file: Parallel fetch of independent vendor prices.
+        // @consumers: PricingAggregator
+
+        package com.example.pricing
+
+        import kotlinx.coroutines.CancellationException
+        import kotlinx.coroutines.CoroutineDispatcher
+        import kotlinx.coroutines.async
+        import kotlinx.coroutines.supervisorScope
+        import kotlinx.coroutines.withContext
+
+        /**
+         * @purpose Fetch prices from multiple vendors in parallel, tolerating individual failures.
+         * @invariant One vendor failure does not cancel siblings; failed vendors surface as null in the map.
+         * @param vendorIds Vendor identifiers to query.
+         * @return Map from vendor id to price; null value = vendor failed for this call.
+         * @sideEffect Network: parallel GETs to /v1/prices per vendor.
+         * @sideEffect Dispatch: injected `io` dispatcher.
+         */
+        class VendorPricing(
+            private val _priceClient: PriceClient,
+            private val _io: CoroutineDispatcher,
+        ) {
+            suspend fun fetchVendorPrices(vendorIds: List<VendorId>): Map<VendorId, Price?> =
+                withContext(_io) {
+                    supervisorScope {
+                        vendorIds.associateWith { id ->
+                            async {
+                                try {
+                                    _priceClient.retrievePrice(id)
+                                } catch (cancel: CancellationException) {
+                                    throw cancel
+                                } catch (cause: Throwable) {
+                                    null
+                                }
+                            }
+                        }.mapValues { (_, deferred) -> deferred.await() }
+                    }
+                }
+        }
+        ```
+      </Snippet>
+      <Why>`supervisorScope` isolates per-vendor failure; plain `coroutineScope` would cancel all siblings on the first failure. Every `async` is `.await()`-ed inside the scope — no orphan `Deferred`. Dispatcher is injected (testable per `AX_COROUTINE_TESTING`), not hard-coded `Dispatchers.IO`. `CancellationException` is re-thrown as-is per `AX_COROUTINES_STRUCTURED`; other throwables map to a domain null value.</Why>
+    </Pattern>
+
+    <Pattern id="PT_LIFECYCLE_OWNED_SCOPE">
+      <Intent>Long-lived service holds its own `CoroutineScope` with `SupervisorJob`; cancellation is anchored to `close()`; `CoroutineExceptionHandler` reports uncaught failures.</Intent>
+      <Snippet language="kotlin">
+        ```kotlin
+        // @file: Background sync service; owns its own coroutine lifetime.
+
+        package com.example.sync
+
+        import kotlinx.coroutines.CoroutineExceptionHandler
+        import kotlinx.coroutines.CoroutineName
+        import kotlinx.coroutines.CoroutineScope
+        import kotlinx.coroutines.SupervisorJob
+        import kotlinx.coroutines.cancel
+        import kotlinx.coroutines.launch
+
+        /**
+         * @purpose Periodic background sync; owned by DI container, cancelled on `close()`.
+         * @invariant `close()` MUST be called by the owner — any launched work leaks otherwise.
+         * @invariant Uncaught failures in `launch` children surface through `_exceptions` (never crash the scope).
+         * @sideEffect Dispatch: injected `io` dispatcher via `_scope`'s context.
+         */
+        class BackgroundSync(
+            private val _io: kotlinx.coroutines.CoroutineDispatcher,
+            private val _crash: CrashReporter,
+        ) : AutoCloseable {
+
+            //region START_SCOPE_LIFETIME  @invariant: cancelled in close(); handler catches launch children only
+            private val _handler = CoroutineExceptionHandler { _, cause ->
+                _crash.report("[BackgroundSync] uncaught coroutine failure", cause)
+            }
+            private val _scope = CoroutineScope(
+                SupervisorJob() + _io + _handler + CoroutineName("background-sync"),
+            )
+            //endregion END_SCOPE_LIFETIME
+
+            fun schedulePeriodicSync(interval: kotlin.time.Duration) {
+                _scope.launch {
+                    // suspend body — cancellation cooperates via delay + I/O suspend points
+                }
+            }
+
+            override fun close() {
+                _scope.cancel()
+            }
+        }
+        ```
+      </Snippet>
+      <Why>`SupervisorJob` isolates child failures; `CoroutineExceptionHandler` on the root scope catches every uncaught `launch` failure (a handler on a nested `launch` would be silently ignored). `close()` cancellation is the lifecycle anchor. Dispatcher injection makes the scope substitutable in tests.</Why>
+    </Pattern>
+
+    <Pattern id="PT_TIMEOUT_WITH_FALLBACK">
+      <Intent>Bound an integration call with `withTimeoutOrNull` when a timeout has a domain-fallback value; caller gets `null` instead of an exception.</Intent>
+      <Snippet language="kotlin">
+        ```kotlin
+        import kotlin.time.Duration.Companion.seconds
+        import kotlinx.coroutines.withTimeoutOrNull
+
+        /**
+         * @purpose Read cached price if the cache responds within 500 ms; fall back to null (miss).
+         * @invariant Timeout is a cache-miss signal, NOT an error; upstream falls back to origin fetch.
+         * @return Cached price or null on timeout / cache-miss.
+         * @sideEffect Network: GET /cache/prices/{id}.
+         */
+        suspend fun readCachedPrice(id: PriceId): Price? =
+            withTimeoutOrNull(500.milliseconds) {
+                _cacheClient.retrievePrice(id)
+            }
+        ```
+      </Snippet>
+      <Why>`withTimeoutOrNull` maps timeout to a domain-native `null` — no exception noise for the expected «cache too slow» case. `withTimeout` would throw `TimeoutCancellationException`, forcing a `try / catch` at every caller for a routine outcome.</Why>
+    </Pattern>
+
+    <Pattern id="PT_MUTEX_GUARDED_STATE">
+      <Intent>Shared mutable state protected by a suspend-friendly `Mutex`; every acquire uses `withLock { }` so a throw cannot leak the lock.</Intent>
+      <Snippet language="kotlin">
+        ```kotlin
+        import kotlinx.coroutines.sync.Mutex
+        import kotlinx.coroutines.sync.withLock
+
+        class RateBudget(private val _capacity: Int) {
+
+            //region START_STATE  @invariant: `_used` mutated only under `_lock`
+            private val _lock = Mutex()
+            private var _used: Int = 0
+            //endregion END_STATE
+
+            suspend fun tryReserve(amount: Int): Boolean =
+                _lock.withLock {
+                    if (_used + amount > _capacity) {
+                        false
+                    } else {
+                        _used += amount
+                        true
+                    }
+                }
+        }
+        ```
+      </Snippet>
+      <Why>`Mutex.withLock` is the only allowed acquire form — no leaked lock on throw. `synchronized` would block the carrier thread across the suspend body and break dispatcher assumptions.</Why>
+    </Pattern>
+
+    <Pattern id="PT_FLOW_STATE_IN_UI">
+      <Intent>Cold data source (`repository.observeX()`) converted to hot `StateFlow` on a `viewModelScope` with `WhileSubscribed(5_000)` — survives config changes, dies after last collector unsubscribes for 5 s.</Intent>
+      <Snippet language="kotlin">
+        ```kotlin
+        import kotlinx.coroutines.flow.SharingStarted
+        import kotlinx.coroutines.flow.StateFlow
+        import kotlinx.coroutines.flow.stateIn
+
+        class PriceViewModel(
+            _repository: PriceRepository,
+        ) : androidx.lifecycle.ViewModel() {
+
+            /**
+             * @purpose Latest price of the watched product.
+             * @invariant `stateIn` scope = viewModelScope → cancelled on onCleared; SharingStarted survives 5 s
+             *           of no-subscribers to bridge config change without re-subscribing the upstream.
+             */
+            val price: StateFlow<Price?> = _repository
+                .observeCurrentPrice()
+                .stateIn(
+                    scope = viewModelScope,
+                    started = SharingStarted.WhileSubscribed(5_000),
+                    initialValue = null,
+                )
+        }
+        ```
+      </Snippet>
+      <Why>`WhileSubscribed(5_000)` is the canonical UI policy — bridges rotation without keeping the upstream alive forever. `Eagerly` would burn resources when no UI is bound; `Lazily` would drop and re-subscribe on every rotation and lose warm state.</Why>
+    </Pattern>
+
+    <Pattern id="PT_CALLBACK_FLOW_WITH_AWAIT_CLOSE">
+      <Intent>Bridge a callback-based API to `Flow` with mandatory `awaitClose { }` unregister.</Intent>
+      <Snippet language="kotlin">
+        ```kotlin
+        import kotlinx.coroutines.channels.awaitClose
+        import kotlinx.coroutines.flow.Flow
+        import kotlinx.coroutines.flow.callbackFlow
+
+        fun LocationSource.observe(): Flow<Location> = callbackFlow {
+            val listener = LocationListener { loc -> trySend(loc) }
+            registerListener(listener)
+            awaitClose { unregisterListener(listener) }
+        }
+        ```
+      </Snippet>
+      <Why>`awaitClose` runs when the collector cancels — without it the listener stays subscribed past collector lifetime and leaks. `trySend` (non-suspend) is safe on `ProducerScope` and avoids blocking the emitting callback.</Why>
+    </Pattern>
+  </Patterns>
+
+  <AntiPatterns>
+    <AntiPattern id="AP_GLOBAL_SCOPE_RUNBLOCKING">
+      <Bad>`fun start() { GlobalScope.launch { doWork() } }` inside a service; or `fun query(): List&lt;Row&gt; = runBlocking { db.fetchAll() }` inside business logic.</Bad>
+      <WhyBad>`GlobalScope` has no lifecycle — leaks coroutines past the owning service; `runBlocking` in business logic blocks the calling thread and defeats structured concurrency. Violates `AX_COROUTINES_STRUCTURED` and `AX_SCOPE_LIFECYCLE_OWNERSHIP`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        class OrderService(
+            private val _scope: CoroutineScope,
+            private val _io: CoroutineDispatcher,
+        ) {
+            fun start() {
+                _scope.launch { doWork() }
+            }
+
+            suspend fun query(): List<Row> =
+                withContext(_io) { db.fetchAll() }
+        }
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_HARDCODED_DISPATCHER">
+      <Bad>`suspend fun read(): Data = withContext(Dispatchers.IO) { … }` — dispatcher hard-coded inside the service.</Bad>
+      <WhyBad>Every test now needs `Dispatchers.setMain` gymnastics or `runBlocking` — virtual time is unavailable and refactors that change the dispatcher require code edits, not config. Violates `AX_DISPATCHER_DISCIPLINE`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        class Reader(private val _io: CoroutineDispatcher) {
+            suspend fun read(): Data = withContext(_io) { … }
+        }
+        // production wires Dispatchers.IO; tests wire StandardTestDispatcher.
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_ORPHANED_ASYNC">
+      <Bad>`scope.async { work() }` with the returned `Deferred` discarded — the coroutine runs but the exception is swallowed until GC.</Bad>
+      <WhyBad>`async` errors surface at `.await()`; a discarded `Deferred` is a silent failure channel. Violates `AX_COROUTINES_STRUCTURED`. Fire-and-forget belongs to `launch`, not `async`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        scope.launch { work() }                          // fire-and-forget: launch, not async
+        val d = scope.async { work() }; val r = d.await() // awaited within the same scope
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_SWALLOWED_CANCELLATION">
+      <Bad>`try { work() } catch (e: Exception) { log(e) }` inside a suspend function — `CancellationException extends Exception`, so the cancellation is logged and eaten.</Bad>
+      <WhyBad>Cooperative cancellation depends on the exception propagating up to the coroutine builder. A swallowed `CancellationException` leaves the coroutine live after the scope is cancelled — leak + confusing behaviour. Violates `AX_COROUTINES_STRUCTURED` and `kotlin-rules` `AX_CATCH_WRAP_RETHROW`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        try {
+            work()
+        } catch (cancel: CancellationException) {
+            throw cancel
+        } catch (cause: Throwable) {
+            log(cause)
+            throw DomainError("[Service#method] failed", cause)
+        }
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_FLOWON_ON_COLLECTOR">
+      <Bad>`flow.collect { … }.flowOn(Dispatchers.Main)` — placing `flowOn` after `collect`.</Bad>
+      <WhyBad>`flowOn` affects UPSTREAM operators only; anything downstream (including `collect`) runs on the collector's context. Placing `flowOn` after `collect` is a no-op / compile error depending on the receiver type — and reveals a misunderstanding of the operator's directionality. Violates `AX_FLOW_DISCIPLINE`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        flow
+            .map { heavyParse(it) }
+            .flowOn(Dispatchers.Default) // upstream map runs on Default
+            .collect { render(it) }      // collect runs on the collector's dispatcher
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_UNBOUNDED_SHAREDFLOW">
+      <Bad>`MutableSharedFlow&lt;Event&gt;(extraBufferCapacity = Int.MAX_VALUE)` with no back-pressure policy documented.</Bad>
+      <WhyBad>Silent unbounded growth on a hot producer — a slow collector accumulates every emission forever until OOM. Violates `AX_FLOW_DISCIPLINE`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        /**
+         * @invariant Bounded to 64 pending events; DROP_OLDEST when full — telemetry, not audit trail.
+         */
+        val events = MutableSharedFlow<Event>(
+            extraBufferCapacity = 64,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        )
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_JVM_SYNCHRONIZED_IN_SUSPEND">
+      <Bad>`suspend fun update() { synchronized(_lock) { doWork() } }` — JVM lock across a suspend body.</Bad>
+      <WhyBad>The coroutine may resume on a different carrier thread after any nested suspension inside `doWork()`. `synchronized` blocks the underlying thread and its release requires the same thread that acquired — a resumption elsewhere leaves the lock held forever or throws `IllegalMonitorStateException`. Violates `AX_SYNCHRONIZATION_PRIMITIVES`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        private val _lock = Mutex()
+        suspend fun update() = _lock.withLock { doWork() }
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_UNBOUNDED_SUSPEND_CALL">
+      <Bad>`suspend fun fetch(): Payload = _http.get(url)` — no timeout, no library-imposed deadline.</Bad>
+      <WhyBad>A hung server produces a hung coroutine; nothing cancels the call. Violates `AX_TIMEOUT_DISCIPLINE`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        suspend fun fetch(): Payload =
+            withTimeout(5.seconds) { _http.get(url) }
+        ```
+      </Good>
+    </AntiPattern>
+  </AntiPatterns>
+
+  <VerificationHooks>
+    <Hook id="HOOK_NO_GLOBAL_SCOPE">
+      <Purpose>Smoke-grep for forbidden coroutine primitives in production sources.</Purpose>
+      <Command>rg --follow --no-heading -n "\bGlobalScope\b|\brunBlocking\s*\{" -t kotlin --glob '!**/build/**' --glob '!**/*Main.kt' --glob '!**/test/**' --glob '!**/*Test/**' --glob '!**/testFixtures/**'</Command>
+      <Expected>Empty on production sources. `Main.kt` entry-points and test source-sets are exempt.</Expected>
+    </Hook>
+    <Hook id="HOOK_FLOW_TERMINAL_IN_PRODUCER">
+      <Purpose>Advisory smoke-grep for terminal operators (`.collect`, `.toList`) inside `flow { }` builders — the smuggling anti-pattern forbidden by `AX_FLOW_DISCIPLINE`.</Purpose>
+      <Command>rg --follow --no-heading -nU "flow\s*\{[\s\S]{0,400}?\.(collect|toList)\b" -t kotlin --glob '!**/build/**' --glob '!**/test/**' --glob '!**/*Test/**'</Command>
+      <Expected>Advisory smoke only — the regex does not track brace nesting and flags any `.collect` / `.toList` within 400 chars after a `flow {` opening. Manually inspect each match. Long producer bodies (&gt;400 chars) escape detection.</Expected>
+    </Hook>
+    <Hook id="HOOK_CALLBACK_FLOW_AWAIT_CLOSE">
+      <Purpose>Every `callbackFlow { }` MUST contain an `awaitClose` call somewhere in its body.</Purpose>
+      <Command>rg --follow --no-heading -nU "callbackFlow\s*\{[\s\S]{0,2000}?\}" -t kotlin --glob '!**/build/**'</Command>
+      <Expected>Advisory: each hit inspected — the body MUST contain `awaitClose`. Missing `awaitClose` is a leak (`AX_FLOW_DISCIPLINE`).</Expected>
+    </Hook>
+    <Hook id="HOOK_ANDROID_LINT">
+      <Purpose>Android Lint on debug variant catches lifecycle-collect anti-patterns (`launchWhenX` deprecation, main-thread suspend, missing `repeatOnLifecycle`).</Purpose>
+      <Command>./gradlew lintDebug</Command>
+      <Expected>Exit 0. Warnings on coroutine lifecycle issues elevated to error via `lint.xml` when project standards demand it.</Expected>
+    </Hook>
+  </VerificationHooks>
+
+  <RewardCriteria>
+    ✅ No `GlobalScope` in production; `runBlocking` only in `Main.kt` / tests / CLI scripts.
+    ✅ Every long-lived scope built as `CoroutineScope(SupervisorJob() + dispatcher + name)`; cancelled in `close()` / `onCleared()` with an `@invariant` naming the lifecycle event.
+    ✅ Dispatcher explicit at every I/O / CPU boundary; injected via constructor for services (`Dispatchers.IO` in prod wiring, `TestDispatcher` in tests).
+    ✅ `supervisorScope` for concurrent-independent branches; `coroutineScope` for concurrent-dependent.
+    ✅ Every `async` `.await()`-ed inside the same scope; fire-and-forget uses `launch`.
+    ✅ `CancellationException` re-thrown as-is; narrow catch types where possible.
+    ✅ Every network / IPC suspend bounded by `withTimeout` / `withTimeoutOrNull` with `kotlin.time.Duration`.
+    ✅ Shared mutable state under `Mutex.withLock`; no JVM `synchronized` in suspend code; parallelism bounded by `Semaphore` with documented bound.
+    ✅ `Flow` producer dispatcher via `.flowOn(...)` upstream; collectors bound to lifecycle scope; Android UI uses `repeatOnLifecycle` / `collectAsStateWithLifecycle`.
+    ✅ `callbackFlow` ends with `awaitClose { unregister... }`.
+    ✅ `SharedFlow` / `MutableStateFlow` non-default buffer has an `@invariant` naming the bound + policy.
+    ✅ `stateIn` / `shareIn` scope is lifecycle-owned; `SharingStarted` policy matches consumer lifecycle.
+    ✅ Tests use `runTest` + `TestDispatcher`; `Dispatchers.setMain` paired with `resetMain`; Flow assertions use Turbine or explicit `toList`.
+
+    ❌ `GlobalScope` in production; `runBlocking` in business logic.
+    ❌ Hard-coded `Dispatchers.IO` / `Default` inside a service (not injected).
+    ❌ Orphaned `Deferred` (discarded `async` result).
+    ❌ `catch (e: Exception)` / `catch (e: Throwable)` without `CancellationException` rethrow.
+    ❌ `synchronized` / `ReentrantLock` across a `suspend` body.
+    ❌ Network / IPC suspend without a timeout.
+    ❌ `flowOn` placed after `collect`; `emit` inside `withContext` in a `flow { }`.
+    ❌ `callbackFlow` without `awaitClose`.
+    ❌ Unbounded `SharedFlow` buffer with no documented back-pressure policy.
+    ❌ `stateIn` / `shareIn` on `GlobalScope`.
+    ❌ Test uses `runBlocking` around a coroutine SUT that could use `runTest`.
+
+    Cross-linked directives:
+    ● `kotlin-rules` — baseline Kotlin language rules (parent). This directive inherits its KDoc contract, Trace-Prefix, `AX_CATCH_WRAP_RETHROW`, and anchor grammar.
+    ● `compose-rules` — Compose-specific coroutine surfaces (`LaunchedEffect`, `rememberCoroutineScope`, `snapshotFlow`, `produceState`, `collectAsStateWithLifecycle`) layer on top of this directive when the target file is a `@Composable`.
+    ● `android-testing` — testing directive covers `runTest` + `Dispatchers.setMain` boilerplate in the JUnit context.
+  </RewardCriteria>
+</KotlinCoroutinesRules>

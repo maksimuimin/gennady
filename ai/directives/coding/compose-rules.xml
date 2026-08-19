@@ -1,0 +1,449 @@
+<ComposeCodingRules keywords="jetpack_compose, compose, composable, state_hoisting, remember, recomposition, side_effects, launched_effect, disposable_effect, modifier, snapshot_flow, produce_state, composition_local, slot_api, preview, stable, immutable, ai_to_ai" type="coding-rules" ver="1.0">
+  <Mission>
+    Baseline rules for writing Jetpack Compose UI code (`@Composable` functions, `Modifier` chains, side-effect entry points, state management, previews). Layered on top of `kotlin-rules` and `kotlin-coroutines` — inherits the KDoc contract, structural anchors, null-safety, immutability, and structured-concurrency axioms; adds Compose-specific enforcement.
+
+    Scope: Compose UI (`androidx.compose.ui`), Compose Runtime (`androidx.compose.runtime`), Compose Foundation (`androidx.compose.foundation`), Material (M2 / M3), Compose lifecycle interop (`collectAsStateWithLifecycle`), Compose testing (`androidx.compose.ui.test`). Not scoped: Compose Multiplatform desktop / iOS specifics, Compose for Wear OS, Compose-based navigation libraries (Navigation-Compose is layered on top when in use — treat as project-level directive).
+
+    Sources (public standards): official Compose docs (developer.android.com/jetpack/compose), Compose API guidelines (android.googlesource.com/platform/frameworks/support/+/androidx-main/compose/docs/compose-api-guidelines.md), Compose lifecycle & side-effects guide, Compose performance guide (stability, `derivedStateOf`, `key`, `remember`), «Thinking in Compose» talk series. Adopted as timeless engineering practice; version numbers and coordinates omitted.
+
+    **Base axiom:** a `@Composable` function is not a regular function. It runs an unknown number of times, on an unknown thread schedule chosen by the runtime, and it must be **restartable, skippable, and idempotent** with respect to its parameters. Every rule below closes one of those three guarantees.
+
+    **Position in the rules cascade:** `kotlin-rules` (language) → `kotlin-coroutines` (concurrency) → `compose-rules` (UI framework). A composable file activates all three; a non-composable Kotlin file only activates the first two.
+  </Mission>
+
+  <BeliefState>
+    <Axiom id="AX_COMPOSABLE_PURITY">
+      A `@Composable` function's body MUST be deterministic in its parameters and its `remember`-scoped state. No hidden mutable reads (mutable globals, `Date()`, `Random.nextX()` outside `remember`), no direct `withContext` / `runBlocking` (composables cannot suspend into I/O directly — that belongs to a side-effect entry point per `AX_SIDE_EFFECTS`).
+      - Non-deterministic sources (`Random`, current time, generated ids) go into a `remember { ... }` block so the value is stable across recompositions and captured once per composition.
+      - Composables MUST NOT write to `mutableStateOf(...)` during composition — the write is either dropped (`remember` runs once) or triggers an infinite recomposition loop. Writes belong to callbacks (`onClick = { count.value++ }`) or side-effects (`LaunchedEffect`).
+      - I/O, disk reads, blocking calls in a composable body are forbidden — they run on the UI thread every recomposition. Move them to `LaunchedEffect`, `produceState`, or (better) upstream `ViewModel`.
+    </Axiom>
+
+    <Axiom id="AX_STATE_HOISTING">
+      State ownership follows the hoisting principle: the composable that OBSERVES state and the composable that MUTATES state may differ, but the state itself lives at the LOWEST common ancestor that needs both. Rules:
+      - A composable with mutating callbacks MUST be «stateless» — accept `value: T` and `onValueChange: (T) -> Unit` (or the same pair with domain-specific names). Never own `mutableStateOf(...)` inside a reusable UI component.
+      - «Stateful» wrappers exist for convenience only: they hold the `remember { mutableStateOf(...) }` and delegate to the stateless variant. The stateful variant is a thin convenience — NEVER the primary export in a design-system library.
+      - Screen-level state (form data, page filter, selection) lives in `ViewModel` and reaches the screen as a `StateFlow` collected via `collectAsStateWithLifecycle()` per `kotlin-coroutines` `AX_FLOW_DISCIPLINE`. Composables never talk to a repository directly.
+      - `MutableState&lt;T&gt;` (from `mutableStateOf`) is Compose's snapshot-observable box; it MUST be wrapped in `remember { }` at its point of creation, otherwise every recomposition creates a new box and every write is lost.
+    </Axiom>
+
+    <Axiom id="AX_REMEMBER_DISCIPLINE">
+      `remember { ... }` is the composable-scoped memoization primitive. Rules:
+      - Any expensive computation, any object with an identity that must survive recompositions, and any `MutableState` MUST live inside `remember`. Un-remembered objects are recreated every recomposition.
+      - `remember(key1, key2, ...) { ... }` invalidates the memo when a key changes. Use keys derived from the semantic identity of the value — never `Unit` (a static memo is `remember { ... }` without keys) and never a mutable reference (memo would recompute on every recomposition).
+      - `rememberSaveable { ... }` persists across process death via `SavedInstanceState`. Use for UI-state that MUST survive Activity recreation (form input, scroll position for a manually-managed list, expansion flags) — NOT for domain data (that belongs to `ViewModel` + `SavedStateHandle`).
+      - `remember { mutableStateOf(x) }` is the canonical local-state pattern; the shorter `by remember { mutableStateOf(x) }` (property delegate) is preferred at declaration sites for readability.
+      - `derivedStateOf { ... }` wraps a computation that reads other snapshot state and MUST recompute only when its dependencies change — cheap enough to be recomputed lazily, but reads should trigger recomposition of consumers only when the DERIVED value changes. Wrong use (`derivedStateOf` around a non-snapshot read) is a silent no-op.
+    </Axiom>
+
+    <Axiom id="AX_SIDE_EFFECTS">
+      Every action that observes the world outside composition (network call, coroutine launch, subscription, callback registration, resource acquisition) MUST enter through a Compose-runtime side-effect entry. Enforced matrix:
+
+      | Effect API | Runs when | Cancelled when | Use for |
+      |---|---|---|---|
+      | `LaunchedEffect(key1, ...) { ... }` | keys enter composition or change | keys change or composable leaves composition | suspend work bound to composition scope (fetch on first display, restart when `id` changes) |
+      | `DisposableEffect(key1, ...) { ...; onDispose { ... } }` | keys enter composition or change | keys change or composable leaves composition | subscribe/unsubscribe pairs (register + `onDispose { unregister }`) |
+      | `SideEffect { ... }` | every successful composition | never (side channel) | publish snapshot state to non-Compose observers (analytics event on state change); NOT for I/O |
+      | `rememberCoroutineScope()` | first composition; scope survives composition | composable leaves composition | coroutine started FROM a user callback (button click launches a suspend) — never from composition itself |
+      | `produceState(initial, key1, ...) { ... }` | keys enter / change | keys change or composable leaves composition | one-shot suspend that yields a `State&lt;T&gt;` (initial value + subsequent emissions via `value = ...`) |
+      | `snapshotFlow { ... }` | collector active | collector cancelled | convert snapshot reads (Compose state) to a cold `Flow` (rare — usually last resort) |
+
+      Rules:
+      - The keys passed to `LaunchedEffect` / `DisposableEffect` / `produceState` ARE the restart contract. Missing keys = «run once», keys = «restart on change». `LaunchedEffect(Unit)` runs once on enter and cancels on leave — the correct form for «init on show, cleanup on hide».
+      - NEVER call `viewModelScope.launch` / a service's own scope from inside composition. Launching from composition ties the coroutine to a lifecycle Compose does not own — a rotation or navigation-away leaks or double-launches.
+      - `rememberCoroutineScope()` gives a scope tied to the composition entry point; use it ONLY from user-triggered callbacks, never from composition body directly (composition body has no user intent).
+      - `SideEffect` runs on the main thread every successful composition — it is cheap only for pure snapshot-→non-compose bridges. I/O inside `SideEffect` blocks the UI thread every frame the composition succeeds.
+    </Axiom>
+
+    <Axiom id="AX_STABILITY_AND_SKIPPING">
+      Compose skips recomposition of a composable when ALL of its parameters are equal to the previous invocation (structural equality). Skipping requires ALL parameters to be of **stable** types. Rules:
+      - Data classes with only `val`s of stable types are stable if the compiler-plugin can prove immutability. Mark opinionated stability with `@Immutable` (fields are conceptually immutable, `equals` is meaningful) or `@Stable` (public reads are safe to observe, mutations notify consumers — used for observable holders).
+      - Public `List` / `Set` / `Map` are **unstable by default** (the runtime cannot prove the underlying map isn't `MutableMap`). Use `kotlinx.collections.immutable.ImmutableList` / `PersistentList` or wrap collections in an `@Immutable` holder to restore skippability. Plain `listOf(...)` is fine at call sites (compiler proves via allocation site); a `List` parameter received from outside is not.
+      - `lambda` parameters that close over unstable state (or capture composition-local `remember` values without keys) prevent skipping. Extract lambda parameters into `remember { ... }` if they are hot recomposition offenders.
+      - Read Compose Compiler reports (`composeCompiler.reportsDestination = ...`) to identify unstable parameters before optimising blindly — most «recomposes too much» findings surface there.
+      - `@Immutable` / `@Stable` are contracts to the compiler — misapplying them (marking a class with `var` fields as `@Immutable`) silently breaks recomposition; the compiler trusts the annotation.
+    </Axiom>
+
+    <Axiom id="AX_MODIFIER_CHAIN">
+      `Modifier` is order-sensitive and MUST be the LAST parameter of every non-terminal `@Composable` with a visual role. Rules:
+      - Every reusable composable accepts `modifier: Modifier = Modifier` as the LAST parameter. Callers pass position / sizing / semantics via the modifier — the composable NEVER hard-codes `Modifier.padding(16.dp)` on its own root. The composable is a shape; the modifier is placement.
+      - Order matters: `Modifier.padding(8.dp).background(Color.Red)` differs from `Modifier.background(Color.Red).padding(8.dp)` (former: padding around a red box; latter: red padded box). Every ordering choice in a composable body MUST be intentional; document non-obvious orderings in an inline comment.
+      - `Modifier.composed { ... }` is the ONLY way to build a modifier that itself uses `remember` / composition-locals. A modifier factory that does `Modifier.something(remember { ... })` breaks composition rules — the `remember` runs outside a composable and throws.
+      - `Modifier` allocations at call sites are cheap in Compose Compiler ≥1.5 (memoized by the plugin); do not pre-hoist `Modifier` chains into `remember` blocks unless a profiler says otherwise.
+    </Axiom>
+
+    <Axiom id="AX_COMPOSABLE_NAMING">
+      `@Composable` functions that emit UI use `PascalCase` (`OrderList`, `PriceCard`) — they are noun-shaped surfaces, not verbs, per official Compose API guidelines. `@Composable` functions that return a value (do NOT emit) follow the regular Kotlin verb convention (`rememberScrollState`, `animateColorAsState`).
+      - Never prefix with `Show*` / `Draw*` — the noun is the surface. A `Show` verb belongs to a state-management API, not a rendering function.
+      - Slot parameters (`content: @Composable () -> Unit`) are named after the slot's role (`title`, `actions`, `content`) — never `slot1` / `bodyLambda`.
+      - Suffix `*Preview` reserved for `@Preview`-annotated helpers (`OrderListPreview_Loaded`, `OrderListPreview_Empty`). Preview names document the scenario in the name.
+    </Axiom>
+
+    <Axiom id="AX_PREVIEW_DISCIPLINE">
+      Every reusable composable in a design-system or shared UI module has `@Preview` coverage across the meaningful state axes. Rules:
+      - One `@Preview` per distinct visual state (loaded, empty, error, loading, RTL, dark theme, large font). Multi-state coverage is not a Storybook «nice-to-have» — a missing state is an untested render.
+      - Previews MUST NOT touch real dependencies (no `hiltViewModel()` in a preview, no `LocalContext.current.getSystemService(...)` with side effects). Fake dependencies via preview-parameter providers or local test doubles.
+      - `@PreviewParameter(...)` is the canonical way to sweep parametric state (list of sample orders → one preview per sample); avoid hand-rolled preview loops.
+      - Preview functions are `private` and named `<Composable>Preview_<state>` for grep-navigation.
+      - Do NOT wrap production `LaunchedEffect` / real network in a `@Preview` composable — preview runs in the IDE / release APK; a fetch in preview leaks credentials and crashes without emulator context. If a composable requires an effect to render sensibly, provide a preview-only variant that injects a fake state.
+    </Axiom>
+
+    <Axiom id="AX_COMPOSITION_LOCAL_DISCIPLINE">
+      `CompositionLocal` is the last-resort dependency-injection mechanism in Compose — implicit, un-typed by the composable signature, and easy to misuse. Rules:
+      - Use `CompositionLocal` only for cross-cutting UI-only dependencies (theme, typography, `LocalContentColor`, `LocalDensity`); never for domain services (repositories, use-cases). Domain services enter via `ViewModel` or explicit parameters.
+      - Define via `compositionLocalOf { defaultValue }` (recomposes readers on change) or `staticCompositionLocalOf { ... }` (does NOT recompose — for values that never change during composition, e.g. `LocalDensity`). Wrong choice: `compositionLocalOf` for a static value burns recompositions; `staticCompositionLocalOf` for a changing value silently keeps stale readers.
+      - Provide via `CompositionLocalProvider(LocalX provides value) { content() }` at the module root, never scattered mid-tree unless the intent is to override for a subtree.
+      - Every custom `CompositionLocal` MUST have a `@Composable`-agnostic default (`error("Local not provided")` in `staticCompositionLocalOf { ... }` when a provider is mandatory).
+    </Axiom>
+
+    <Axiom id="AX_LAZY_LIST_KEYS">
+      `LazyColumn` / `LazyRow` / `LazyVerticalGrid` items MUST supply a `key` when the collection can reorder, insert, or remove — otherwise Compose maps by position and stateful children (animations, `remember`-holdings, focus) attach to the wrong item. Rules:
+      - `items(list, key = { it.id }) { ... }` is the canonical form. Missing `key` is a bug on any list with reordering / removal.
+      - `contentType` is the second parameter — supply when the list is heterogeneous so Compose can reuse layouts across types.
+      - `key` MUST be stable and unique per item (typically the domain id). NEVER use `hashCode()` of a mutable object or the item's index (defeats the purpose).
+    </Axiom>
+
+    <Axiom id="AX_COMPOSE_TESTING">
+      Compose UI is tested via `androidx.compose.ui.test` (`ComposeTestRule`, `createComposeRule` / `createAndroidComposeRule`, `onNodeWithTag` / `onNodeWithText`, `performClick`, `assertIsDisplayed`). Rules:
+      - Prefer semantics-based queries (`onNodeWithContentDescription`, `onNodeWithText`) over `onNodeWithTag` — mirrors accessibility semantics and reveals a11y regressions.
+      - `Modifier.testTag(...)` is used ONLY when semantic queries are insufficient (rare: layout containers with no text / no content description).
+      - Time is virtual by default via `mainClock` — `mainClock.advanceTimeBy(1000)` advances animations without wall-clock delay.
+      - Isolate coroutine dispatchers per `kotlin-coroutines` `AX_COROUTINE_TESTING` — the test rule integrates with the composition dispatcher; but any `viewModel` under test uses an injected `TestDispatcher`, not a hard-coded one.
+    </Axiom>
+  </BeliefState>
+
+  <Definitions>
+    <Definition id="DEF_STATELESS_COMPOSABLE">A composable that takes `value` + `onValueChange` (or the domain analogue) and owns no `MutableState`. Reusable, testable in isolation, and portable across screens.</Definition>
+    <Definition id="DEF_STATEFUL_COMPOSABLE">A thin convenience wrapper around a stateless composable: holds `remember { mutableStateOf(...) }` and forwards `value` / `onValueChange` to the stateless variant. Never the primary export.</Definition>
+    <Definition id="DEF_RESTARTABLE">A composable that can be re-executed by the runtime with the same parameters and produce identical UI. Enforced by `AX_COMPOSABLE_PURITY`.</Definition>
+    <Definition id="DEF_SKIPPABLE">A composable whose recomposition can be skipped when ALL parameters are equal-by-structure to the previous call. Requires stable parameters per `AX_STABILITY_AND_SKIPPING`.</Definition>
+    <Definition id="DEF_SIDE_EFFECT_ENTRY">One of `LaunchedEffect`, `DisposableEffect`, `SideEffect`, `rememberCoroutineScope`, `produceState`, `snapshotFlow`. The ONLY sanctioned entries into non-composition work.</Definition>
+  </Definitions>
+
+  <Patterns>
+    <Pattern id="PT_STATELESS_STATEFUL_PAIR">
+      <Intent>State-hoisted counter: stateless variant is the reusable primitive; a thin `rememberCounter` / stateful wrapper exists for convenience only.</Intent>
+      <Snippet language="kotlin">
+        ```kotlin
+        /**
+         * @purpose Stateless counter display + increment. Callers own the count state.
+         * @param count Current count value.
+         * @param onIncrement Fires when the user presses the increment button.
+         * @param modifier External placement.
+         */
+        @Composable
+        fun Counter(
+            count: Int,
+            onIncrement: () -> Unit,
+            modifier: Modifier = Modifier,
+        ) {
+            Row(modifier) {
+                Text(text = count.toString())
+                Button(onClick = onIncrement) { Text("+") }
+            }
+        }
+
+        /**
+         * @purpose Convenience wrapper. Owns state; rarely the right export.
+         * @invariant State survives config change via rememberSaveable.
+         */
+        @Composable
+        fun CounterStateful(modifier: Modifier = Modifier) {
+            var count by rememberSaveable { mutableStateOf(0) }
+            Counter(count = count, onIncrement = { count++ }, modifier = modifier)
+        }
+        ```
+      </Snippet>
+      <Why>Stateless variant is testable in isolation and reusable in every screen. Stateful wrapper exists purely as a code-golf convenience; libraries export the stateless form as the primary API per `AX_STATE_HOISTING`.</Why>
+    </Pattern>
+
+    <Pattern id="PT_LAUNCHED_EFFECT_KEYED">
+      <Intent>Restart a fetch when `orderId` changes; cancel automatically when the composable leaves.</Intent>
+      <Snippet language="kotlin">
+        ```kotlin
+        @Composable
+        fun OrderDetail(orderId: OrderId, viewModel: OrderViewModel) {
+            LaunchedEffect(orderId) {
+                viewModel.loadOrder(orderId)
+            }
+            val state by viewModel.state.collectAsStateWithLifecycle()
+            OrderContent(state)
+        }
+        ```
+      </Snippet>
+      <Why>`LaunchedEffect(orderId)` restarts on id change and cancels on leave — the restart contract is the key. `LaunchedEffect(Unit)` would run once and never restart. `collectAsStateWithLifecycle` respects Android lifecycle per `kotlin-coroutines` `AX_FLOW_DISCIPLINE`.</Why>
+    </Pattern>
+
+    <Pattern id="PT_DISPOSABLE_EFFECT_SUBSCRIBE">
+      <Intent>Subscribe / unsubscribe pair anchored to composition lifetime — analytics screen-view event.</Intent>
+      <Snippet language="kotlin">
+        ```kotlin
+        @Composable
+        fun TrackScreen(screenName: String, analytics: Analytics) {
+            DisposableEffect(screenName) {
+                analytics.startScreenView(screenName)
+                onDispose { analytics.endScreenView(screenName) }
+            }
+        }
+        ```
+      </Snippet>
+      <Why>`DisposableEffect` binds the subscribe/unsubscribe pair to composition lifetime. `LaunchedEffect` would need a `try { … } finally { … }` pattern with weaker guarantees (finally runs on cancellation but not on structural re-key without cleanup).</Why>
+    </Pattern>
+
+    <Pattern id="PT_REMEMBER_COROUTINE_SCOPE_ON_CLICK">
+      <Intent>Coroutine launched from a user callback — `rememberCoroutineScope` is the correct scope entry.</Intent>
+      <Snippet language="kotlin">
+        ```kotlin
+        @Composable
+        fun SaveButton(onSave: suspend () -> Unit) {
+            val scope = rememberCoroutineScope()
+            Button(onClick = {
+                scope.launch { onSave() }
+            }) { Text("Save") }
+        }
+        ```
+      </Snippet>
+      <Why>The suspend call belongs to a user event, not to composition itself. `rememberCoroutineScope` scope survives recompositions; leaves composition = scope cancelled. Direct `LaunchedEffect` here would fire on every composition, not on click.</Why>
+    </Pattern>
+
+    <Pattern id="PT_STABLE_LIST_PARAM">
+      <Intent>Restore skippability for a composable receiving a list from outside — `ImmutableList` marks the boundary.</Intent>
+      <Snippet language="kotlin">
+        ```kotlin
+        import kotlinx.collections.immutable.ImmutableList
+        import kotlinx.collections.immutable.persistentListOf
+
+        /**
+         * @purpose Render an ordered list. Skippable when `items` reference is unchanged.
+         * @param items Immutable list of orders. Structural equality drives skipping per AX_STABILITY_AND_SKIPPING.
+         */
+        @Composable
+        fun OrderList(items: ImmutableList<Order>, modifier: Modifier = Modifier) {
+            LazyColumn(modifier) {
+                items(items, key = { it.id.value }) { order ->
+                    OrderRow(order)
+                }
+            }
+        }
+        ```
+      </Snippet>
+      <Why>Plain `List&lt;Order&gt;` parameter is unstable — the runtime cannot prove the underlying map isn't `MutableList`. `ImmutableList` (or an `@Immutable`-annotated holder) restores skipping. `items(key = { ... })` is required per `AX_LAZY_LIST_KEYS`.</Why>
+    </Pattern>
+
+    <Pattern id="PT_DERIVED_STATE_FOR_EXPENSIVE_READ">
+      <Intent>`derivedStateOf` caches a computed value; consumers recompose only when the derived value changes, not when its inputs change.</Intent>
+      <Snippet language="kotlin">
+        ```kotlin
+        @Composable
+        fun ScrollToTopFab(listState: LazyListState) {
+            val showFab by remember {
+                derivedStateOf { listState.firstVisibleItemIndex > 5 }
+            }
+            if (showFab) {
+                FloatingActionButton(onClick = { /* scroll to top */ }) { … }
+            }
+        }
+        ```
+      </Snippet>
+      <Why>`listState.firstVisibleItemIndex` changes on every scroll pixel; a bare read would recompose the FAB on every frame. `derivedStateOf` recomputes but only invalidates readers when the boolean actually flips — one recomposition at the threshold crossing, not thousands.</Why>
+    </Pattern>
+
+    <Pattern id="PT_STATE_FLOW_TO_UI">
+      <Intent>`ViewModel` exposes `StateFlow`; UI collects with lifecycle awareness.</Intent>
+      <Snippet language="kotlin">
+        ```kotlin
+        // ViewModel per kotlin-coroutines PT_FLOW_STATE_IN_UI:
+        // val orders: StateFlow<OrdersState> = ... .stateIn(viewModelScope, WhileSubscribed(5_000), Loading)
+
+        @Composable
+        fun OrdersScreen(viewModel: OrdersViewModel) {
+            val state by viewModel.orders.collectAsStateWithLifecycle()
+            when (val s = state) {
+                is Loading -> LoadingIndicator()
+                is Loaded  -> OrderList(s.items)
+                is Failed  -> ErrorPanel(s.cause)
+            }
+        }
+        ```
+      </Snippet>
+      <Why>`collectAsStateWithLifecycle()` respects `Lifecycle.State.STARTED` — the UI pauses collection when backgrounded, avoiding wasted emissions and battery. `by` delegate makes the state read syntactically identical to a property access. `when` on a sealed `OrdersState` gives exhaustive rendering per `kotlin-rules` `AX_WHEN_EXHAUSTIVENESS`.</Why>
+    </Pattern>
+  </Patterns>
+
+  <AntiPatterns>
+    <AntiPattern id="AP_WRITE_STATE_IN_COMPOSITION">
+      <Bad>`@Composable fun Bad() { var x by remember { mutableStateOf(0) }; x++; Text("$x") }` — mutation inside composition body triggers infinite recomposition.</Bad>
+      <WhyBad>Every write invalidates the composable → re-runs → writes again → infinite loop. Violates `AX_COMPOSABLE_PURITY`. Writes belong to callbacks or side-effect entries.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        @Composable
+        fun Good(onTick: () -> Unit) {
+            var x by remember { mutableStateOf(0) }
+            LaunchedEffect(Unit) {
+                while (true) { delay(1.seconds); x++ } // writes from a side-effect scope
+            }
+            Text("$x")
+        }
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_UNREMEMBERED_STATE">
+      <Bad>`@Composable fun Bad() { var x by mutableStateOf(0); Button(onClick = { x++ }) { Text("$x") } }` — missing `remember` around `mutableStateOf`.</Bad>
+      <WhyBad>`mutableStateOf(0)` allocates a NEW `MutableState` every recomposition, so every button press resets to 0. Violates `AX_REMEMBER_DISCIPLINE`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        var x by remember { mutableStateOf(0) } // one box, survives recompositions
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_LAUNCH_FROM_COMPOSITION_BODY">
+      <Bad>`@Composable fun Bad(vm: VM) { vm.scope.launch { vm.load() }; Text("...") }` — launching from composition body.</Bad>
+      <WhyBad>The launch fires on every recomposition (potentially many times per second), leaks / double-fetches, and ties the coroutine to a scope Compose does not own. Violates `AX_SIDE_EFFECTS`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        LaunchedEffect(Unit) { vm.load() } // fires once on enter, cancels on leave
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_MISSING_LAZY_KEY">
+      <Bad>`items(orders) { OrderRow(it) }` — no `key` on a reorderable list.</Bad>
+      <WhyBad>Compose maps items by index. Insertion / reorder attaches state (animations, expansion, focus, `rememberSaveable`) to the wrong item. Visual jank + wrong state. Violates `AX_LAZY_LIST_KEYS`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        items(orders, key = { it.id.value }) { OrderRow(it) }
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_MODIFIER_HARDCODED_PADDING">
+      <Bad>`@Composable fun MyCard(text: String) { Card(modifier = Modifier.padding(16.dp)) { Text(text) } }` — the composable owns its outer padding.</Bad>
+      <WhyBad>The composable now has a hidden opinion about its container's spacing. Every caller inherits the padding and cannot remove it. Violates `AX_MODIFIER_CHAIN`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        @Composable
+        fun MyCard(text: String, modifier: Modifier = Modifier) {
+            Card(modifier = modifier) { Text(text) }
+        }
+        // callers do: MyCard(text, Modifier.padding(16.dp))
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_UNSTABLE_LIST_PARAM">
+      <Bad>`@Composable fun BadList(items: List&lt;Order&gt;) { ... }` — plain `List` parameter breaks skipping.</Bad>
+      <WhyBad>The Compose Compiler cannot prove `List` is immutable; the composable becomes non-skippable and re-runs on every parent recomposition. Violates `AX_STABILITY_AND_SKIPPING`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        @Composable
+        fun GoodList(items: ImmutableList<Order>) { ... }
+        // OR wrap:
+        @Immutable data class OrdersUi(val items: List<Order>)
+        @Composable fun GoodList(state: OrdersUi) { ... }
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_COMPOSITION_LOCAL_FOR_DOMAIN">
+      <Bad>`val LocalOrdersRepo = compositionLocalOf&lt;OrdersRepo&gt; { error("no repo") }` — domain service in a `CompositionLocal`.</Bad>
+      <WhyBad>Implicit dependency invisible in composable signature; testability collapses (every test must wrap in `CompositionLocalProvider`); coupling between UI and repository grows sideways. Violates `AX_COMPOSITION_LOCAL_DISCIPLINE`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        // Domain enters via ViewModel; ViewModel is the composable's parameter.
+        @Composable
+        fun OrdersScreen(viewModel: OrdersViewModel = hiltViewModel()) { ... }
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_PREVIEW_TOUCHES_REAL_DEPS">
+      <Bad>`@Preview @Composable fun MyPreview() { OrdersScreen(hiltViewModel()) }` — preview instantiates a real Hilt ViewModel.</Bad>
+      <WhyBad>Preview runs outside Application context; `hiltViewModel()` throws or fetches real data / credentials. Preview becomes non-functional and the failure mode is silent (broken preview panel). Violates `AX_PREVIEW_DISCIPLINE`.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        @Preview @Composable
+        private fun OrdersScreenPreview_Loaded() {
+            OrdersScreen(viewModel = FakeOrdersViewModel(state = loadedSample()))
+        }
+        ```
+      </Good>
+    </AntiPattern>
+
+    <AntiPattern id="AP_IO_IN_COMPOSITION_BODY">
+      <Bad>`@Composable fun Bad() { val json = File("cfg.json").readText(); Text(json) }` — I/O on the UI thread every recomposition.</Bad>
+      <WhyBad>Runs on the main thread on every composition. Violates `AX_COMPOSABLE_PURITY`; jank at best, ANR at worst.</WhyBad>
+      <Good language="kotlin">
+        ```kotlin
+        val json by produceState<String?>(initialValue = null) {
+            value = withContext(Dispatchers.IO) { File("cfg.json").readText() }
+        }
+        json?.let { Text(it) }
+        ```
+      </Good>
+    </AntiPattern>
+  </AntiPatterns>
+
+  <VerificationHooks>
+    <Hook id="HOOK_COMPILE">
+      <Purpose>Compose compiler runs during Kotlin compilation; verifies annotations, checks `@Composable` call sites, emits stability reports.</Purpose>
+      <Command>./gradlew compileDebugKotlin</Command>
+      <Expected>Exit 0. Compose Compiler warnings on `@Composable` misuse elevated to error via compiler flags where project standards demand.</Expected>
+    </Hook>
+    <Hook id="HOOK_COMPOSE_STABILITY_REPORT">
+      <Purpose>Compose Compiler emits per-composable stability reports (`composables.txt`, `classes.txt`) when configured; used to audit skippability.</Purpose>
+      <Command>./gradlew assembleDebug -PcomposeCompilerReports=true</Command>
+      <Expected>`build/compose_compiler/*.txt` produced. Composables marked `restartable skippable` where inputs are stable; any `restartable !skippable` finding traced to an unstable parameter (usually a raw `List` / lambda capture).</Expected>
+    </Hook>
+    <Hook id="HOOK_NO_STATE_WRITE_IN_COMPOSITION">
+      <Purpose>Advisory smoke-grep for direct `MutableState` writes inside composable bodies (heuristic).</Purpose>
+      <Command>rg --follow --no-heading -nU "@Composable[\s\S]{0,400}?\.value\s*=|@Composable[\s\S]{0,400}?\bby\s+remember[\s\S]{0,100}?[+\-]{2}" -t kotlin --glob '!**/build/**' --glob '!**/test/**'</Command>
+      <Expected>Advisory only; false positives are frequent (inside `LaunchedEffect`, callback, or slot lambda). Manually inspect each match — the finding is a violation ONLY when the write executes at composition time.</Expected>
+    </Hook>
+    <Hook id="HOOK_MODIFIER_LAST_PARAM">
+      <Purpose>Advisory smoke-grep for `@Composable` functions whose `Modifier` parameter is not last (or missing when needed).</Purpose>
+      <Command>rg --follow --no-heading -nU "@Composable[\s\S]{0,50}?fun\s+[A-Z]\w*\([^)]*modifier:\s*Modifier[^)]*,\s*[a-zA-Z]" -t kotlin --glob '!**/build/**'</Command>
+      <Expected>Empty or few advisories; every hit is a signature to fix per `AX_MODIFIER_CHAIN`.</Expected>
+    </Hook>
+    <Hook id="HOOK_ANDROID_LINT">
+      <Purpose>Android Lint on debug variant — catches `ComposableNaming`, `ComposableLambdaParameterNaming`, `RememberInComposition`, `ProduceStateDoesNotAssignValue`, and other Compose-specific lints.</Purpose>
+      <Command>./gradlew lintDebug</Command>
+      <Expected>Exit 0. Compose lint issues elevated to error via `lint.xml`.</Expected>
+    </Hook>
+  </VerificationHooks>
+
+  <RewardCriteria>
+    ✅ Every reusable composable is stateless (`value` + `onValueChange`); stateful wrapper exists only as a convenience.
+    ✅ `modifier: Modifier = Modifier` is the LAST parameter of every UI-emitting composable.
+    ✅ Every `mutableStateOf(...)` wrapped in `remember { ... }`; `by remember { mutableStateOf(x) }` used at declaration sites.
+    ✅ `rememberSaveable` used for UI state that must survive process death (form inputs, expansion flags).
+    ✅ Side effects entered via the correct API (`LaunchedEffect` for keyed suspend, `DisposableEffect` for subscribe/unsubscribe, `rememberCoroutineScope` for click-launched coroutines, `produceState` for one-shot suspend → state).
+    ✅ Composable body free of I/O, blocking calls, direct `Dispatchers.*` `withContext`, direct scope launches.
+    ✅ Stability restored on external-list parameters via `ImmutableList` / `@Immutable` holder; recomposition audited via Compose Compiler reports.
+    ✅ `LazyColumn` / `LazyRow` items supply stable domain-id `key`; heterogeneous lists supply `contentType`.
+    ✅ `StateFlow` from ViewModel consumed via `collectAsStateWithLifecycle()`; render via `when` on sealed UI state.
+    ✅ `CompositionLocal` used for UI-only cross-cutting concerns (theme, density); domain services enter via `ViewModel` / explicit parameters.
+    ✅ `@Preview` covers every meaningful state axis; previews inject fake dependencies; naming: `<Composable>Preview_<state>`.
+    ✅ Composable naming: `PascalCase` for UI-emitting; verb-shape (`rememberX`, `animateX`) for value-returning composables.
+    ✅ Compose UI tests prefer semantic queries; `testTag` reserved for cases with no semantics; virtual `mainClock` for animation assertions.
+
+    ❌ `mutableStateOf` write during composition body (outside a callback / side-effect entry).
+    ❌ `mutableStateOf` without a surrounding `remember`.
+    ❌ Coroutine launched from composition body (not from a user callback via `rememberCoroutineScope` or a `LaunchedEffect`).
+    ❌ Missing `key` on a reorderable `LazyColumn` / `LazyRow`.
+    ❌ Hard-coded `Modifier.padding(...)` / `Modifier.background(...)` on a composable root; `modifier` parameter missing or not last.
+    ❌ Unstable list / map parameter without an `@Immutable` holder or `ImmutableList`.
+    ❌ `CompositionLocal` holding a domain service (repository, use-case).
+    ❌ `@Preview` instantiating real `hiltViewModel()`, `LocalContext.current.getSystemService(...)` with side effects, or firing real network.
+    ❌ I/O, `File.readText`, `withContext(Dispatchers.IO)` inside composition body.
+    ❌ `SideEffect` used for anything other than snapshot→non-Compose bridge (no I/O, no coroutine launch).
+    ❌ Composable naming: `Show*` / `Draw*` prefixes; slot parameters named `slot1` / `bodyLambda`.
+
+    Cross-linked directives:
+    ● `kotlin-rules` — baseline language rules (transitive parent). KDoc contract, structural anchors, null-safety, immutability, exhaustive `when` on sealed UI state.
+    ● `kotlin-coroutines` — direct parent. All coroutine surfaces used inside Compose side effects (`LaunchedEffect`, `rememberCoroutineScope`, `produceState`, `snapshotFlow`, `collectAsStateWithLifecycle`) inherit its structured-concurrency, dispatcher-injection, and Flow-discipline rules.
+    ● `android-testing` — Compose UI test rule integration; JUnit4/JUnit5 base for `ComposeTestRule`.
+    ● `android-setup` — Compose compiler plugin activation + stability-report configuration in Gradle.
+  </RewardCriteria>
+</ComposeCodingRules>
