@@ -1,0 +1,188 @@
+<AndroidSetup keywords="android, agp, gradle, gradlew, wrapper, kotlin, ktlint, detekt, spotless, libs-versions-toml, multi-module, verification-gates, stack-plugin, sandbox, gennadyrc" type="infra-rules" ver="1.0">
+  <Mission>
+    Canonical rules for the Android/AGP toolchain layer of an SDD project: wrapper discipline, Gradle verification gates, sandboxed caches, and how an agent runs them without blowing up on a brownfield multi-module repository.
+
+    The deterministic surface is the stack plugin system: **one command — `gennady verify` — for every stack**; Android specifics live in the `android` plugin, repo specifics live in `gennady.yaml` (section `stack`; personal `.gennadyrc` deep-merges on top). Never invent per-repo Gradle wrappers or ad-hoc `./gradlew` recipes: parameterise the plugin through config instead.
+
+    **Base axiom:** a verification gate observes; it never rewrites the working tree, and it never claims a verdict about code when the tool itself failed to run.
+  </Mission>
+
+  <BeliefState>
+    <Axiom id="AX_ONE_VERB_EVERY_STACK">
+      Verification is ONE verb — `gennady verify` — regardless of stack. Different repositories differ through committed stack config (`gennady.yaml`) (gate overrides, skips, extra gates), not through different commands.
+
+      An agent that must remember `./gradlew check` here, `./gradlew app:assembleDebug` there, `make android` elsewhere will pick the wrong one. Detection chooses the plugin; config expresses the repo's deviations; the verb stays constant.
+    </Axiom>
+
+    <Axiom id="AX_GATES_NEVER_MUTATE">
+      A verification gate MUST NOT modify source files.
+
+      **`./gradlew ktlintFormat` and `./gradlew spotlessApply` are forbidden as gates.** They rewrite sources in place — running them inside verification means the gate always passes and silently edits the agent's diff, destroying the phase boundary.
+
+      Use the check-only twins: `ktlintCheck`, `spotlessCheck`, `detekt`. They report offenders and exit non-zero without touching the tree. Autofix belongs in an explicit, operator-invoked fix step (post-v1 `fix` facet) — never in the gate. This applies to config-declared extraGates too: a gate that writes is a bug in the config.
+    </Axiom>
+
+    <Axiom id="AX_WRAPPER_IS_SOURCE_OF_TRUTH">
+      Only `./gradlew` is used — never a system-installed `gradle` binary. All five wrapper files are mandatory for detection: `settings.gradle{.kts}`, `build.gradle{.kts}`, `gradlew`, `gradle/wrapper/gradle-wrapper.jar`, `gradle/wrapper/gradle-wrapper.properties`. Miss any one → detect returns `null` (not a diagnostic — same principle as a missing `go.mod`).
+
+      Corp-policy repos that keep `gradle-wrapper.jar` out of git are opted in explicitly via `stack.use: [android]` in `gennady.yaml`. Silent "half-detect" would produce ENV_FAIL on the first `./gradlew` call with a misleading expectation.
+    </Axiom>
+
+    <Axiom id="AX_GATE_ORDER_IS_DIAGNOSTIC">
+      Gates run cheapest-and-most-diagnostic first: **assemble → lint → test** (base tasks `assembleDebug`, `lintDebug`, `testDebugUnitTest`) plus optional Kotlin linters (`ktlintCheck`, `detekt`, `spotlessCheck`) after lint. A compile error makes every downstream gate's output noise; still all gates execute (RUN-ALL) so one pass collects the full picture.
+
+      **Never bundle as `./gradlew check`.** The bundled aggregator hides which gate broke, disables `--only=android:lint`, and kills symmetry with `golang` (`build → vet → fmt → lint → test`) and `node` (typecheck / lint / test).
+    </Axiom>
+
+    <Axiom id="AX_OPTIONAL_LINTERS_SKIP_WHEN_ABSENT">
+      `ktlintCheck`, `detekt`, `spotlessCheck` are planned gates only when the corresponding Gradle plugin is applied — `org.jlleitschuh.gradle.ktlint`, `io.gitlab.arturbosch.detekt`, `com.diffplug.spotless`. Detection reads the root `build.gradle{.kts}` plus the AGP-holder submodule; direct or alias form via `libs.versions.toml`. Absent → gate is `skipped: <reason>`, not FAIL. Symmetrical to golang `generate` skipping when no `//go:generate` directives exist.
+
+      **Known limitation (not a diagnostic):** an optional plugin applied only in a third submodule (`:core`, `:feature/x`) is invisible to auto-detection. Operator wires it explicitly via `extraGates` in the config; scanning every submodule per detect is not worth the I/O.
+    </Axiom>
+
+    <Axiom id="AX_SANDBOX_KEEPS_ENV_NOT_STATE">
+      Verification runs in a replica of the tree (D-STACK-013). Android declares `sandboxLinks: ['.gradle', '.kotlin']` — Gradle config-cache + daemon state, and Kotlin K2 incremental compiler metadata. These are **environment**, not tree state: they cache configuration and compiler-daemon work between runs, not compiled artifacts.
+
+      **`build/` is deliberately NOT linked.** It IS tree state (intermediate dex, R.java, .class); linking it would break fresh-clone semantics for the actual artifacts. Compromise: config-cache and K2 daemon caches yes; compiled code no. Without these two links every `verify` is a cold Gradle run (5–15 min on a mid-size project) and the agent silently learns to skip verification.
+    </Axiom>
+
+    <Axiom id="AX_AGP_JDK_SKEW_AT_ASSEMBLE">
+      Distinguish "the tool found problems in your code" (FAIL) from "the tool could not run" (ENV_FAIL). But **AGP × JDK skew is not probed at `detect`** — the probe costs 3–8s Gradle daemon start per run and JDK toolchain semantics (`libs.versions.toml` toolchain block, `.sdkmanrc`, `.jvmrc`) is too deep to parse cheaply. Skew surfaces as an ENV_FAIL on the first `assembleDebug` with a clear Gradle message — the plugin lets Gradle self-report.
+
+      Gate-level envFail predicates (`Unsupported class file major version`, `requires JDK`, daemon crashes) still classify the outcome correctly; agents MUST NOT edit sources in response to ENV_FAIL.
+    </Axiom>
+
+    <Axiom id="AX_MODULE_LIMIT_32">
+      Detection reads at most 32 submodules from `settings.gradle{.kts}` looking for the AGP-holder. Hitting exactly 32 without finding AGP → detect returns `null` **and** emits `ANDROID_MODULE_LIMIT_EXCEEDED` diagnostic with the fix: `stack.use: [android]` + `--root=<path-to-agp-module>`. This is a hard I/O bound, not a policy.
+
+      A repo layout where AGP lives in the 33+-nth submodule is pathological; the escape hatch is explicit config, not silent skipping.
+    </Axiom>
+
+    <Axiom id="AX_ALIAS_RESOLVED_BY_ID_NOT_NAME">
+      Gradle Version Catalog aliases are variable names — the `id` field is canonical. Real projects use `agp`, `android-app`, `androidApplication`, whatever. The plugin resolves by scanning `[plugins]` for `id = "com.android.application"` / `"com.android.library"`, taking the alias on the left, and converting `-`/`_` → `.` (TOML `android-application` → DSL `libs.plugins.android.application`).
+
+      Never hardcode alias names in configs or scripts. If a custom alias breaks detection, fix the TOML or use direct-form `id("…")` — do not paper over with `stack.use: [android]` unless the underlying assumption (wrapper present, AGP applied somewhere) actually fails.
+    </Axiom>
+  </BeliefState>
+
+  <SetupSteps>
+    <Step id="STEP_1_INSPECT">Run `gennady verify --plan` from the repo root. Read: detected AGP holder module, resolved alias (if any), AGP version from `libs.versions.toml`, wrapper paths, optional-linter plugins detected, sandbox links declared, and the exact `./gradlew` argv of every gate.</Step>
+    <Step id="STEP_2_RESOLVE_DIAGNOSTICS">For each diagnostic (missing wrapper.jar, `ANDROID_MODULE_LIMIT_EXCEEDED`, unresolved alias), either fix the environment or encode the deviation in `gennady.yaml` (`stack.use`, `skipGates`, `overrideGates`, `extraGates`). Never ignore one silently.</Step>
+    <Step id="STEP_3_ENCODE_REPO_SPECIFICS">If the repo needs a non-default build variant (`assembleRelease`, `testReleaseUnitTest`), an optional linter that lives only in a third submodule, or a custom Gradle property (`-Porg.gradle.jvmargs=…`), express them as stack-config gate overrides / extraGates so every agent gets them for free.</Step>
+    <Step id="STEP_4_WIRE_LOOP">Per-phase gate = `gennady verify` (repo-scoped for Android — Gradle owns incremental scoping via daemon + `.gradle`/`.kotlin` links). Fast inner loop = `--only=android:assemble,lint`. Full sweep on demand = `--all` (adds optional linters that were detected).</Step>
+    <Step id="STEP_5_COVER_UNDETECTED_MODULES">For optional linters applied only in non-detected submodules: add an explicit `extraGate` with `argv: [./gradlew, ':feature:x:ktlintCheck']` and a `timeout`. Do not rely on auto-detection outside the root + AGP-holder.</Step>
+  </SetupSteps>
+
+  <Definitions>
+    <Definition id="DEF_GATE">A single verification command with a binary verdict, a working directory and captured output. Gates observe; they never mutate.</Definition>
+    <Definition id="DEF_ENV_FAIL">A gate outcome where the tool itself could not run (Gradle daemon crash, AGP × JDK skew, missing wrapper.jar, blocked Maven proxy). Distinct from FAIL, which is a genuine finding about the code.</Definition>
+    <Definition id="DEF_STACK_CONFIG">The `stack` section of `gennady.yaml` / `.gennadyrc`: `use` + per-plugin `skipGates`/`overrideGates`/`extraGates`. Single point where a repo's infra deviations are declared.</Definition>
+    <Definition id="DEF_SANDBOX_LINKS">Ignored paths (relative to root) symlinked into the verify replica because they carry stack execution environment, not tree state. Android: `.gradle`, `.kotlin`. Not `build/`.</Definition>
+    <Definition id="DEF_AGP_HOLDER">The `build.gradle{.kts}` file where `com.android.application` / `com.android.library` is applied with `apply true` (direct or alias). Detection reads root first, then submodules from `settings.gradle{.kts}` (limit 32).</Definition>
+  </Definitions>
+
+  <CodePatterns>
+    <Pattern id="PT_INSPECT_BEFORE_RUNNING">
+      <Intent>See what verification would do — and what the environment is missing — before spending Gradle-daemon time on it.</Intent>
+      <Snippet language="bash">
+gennady verify --plan
+      </Snippet>
+      <Why>Prints detection (AGP holder, alias, wrapper paths), diagnostics (module-limit, missing wrapper.jar), sandbox links, and exact gate argv. First command in any unfamiliar Android repo.</Why>
+    </Pattern>
+
+    <Pattern id="PT_PHASE_GATE">
+      <Intent>The canonical per-phase gate. Sandboxed, non-mutating, quiet on success, stack-agnostic.</Intent>
+      <Snippet language="bash">
+gennady verify
+      </Snippet>
+      <Why>Runs `assembleDebug → lintDebug → testDebugUnitTest` plus any detected optional linters, in a replica with `.gradle`/`.kotlin` linked. RUN-ALL, SUPPRESS-ON-SUCCESS, exit 0/1/4/5.</Why>
+    </Pattern>
+
+    <Pattern id="PT_REPO_DEVIATIONS_IN_CONFIG">
+      <Intent>Encode repo-specific Android infra once, in the repo, instead of teaching every agent private commands.</Intent>
+      <Snippet language="yaml">
+stack:
+  android:
+    overrideGates:
+      test:
+        argv: [./gradlew, testReleaseUnitTest]
+        timeout: 20m
+      assemble:
+        env: { GRADLE_OPTS: "-Xmx4g -Dorg.gradle.jvmargs=-Xmx4g" }
+    extraGates:
+      - id: feature-x-ktlint
+        argv: [./gradlew, ':feature:x:ktlintCheck']
+        timeout: 5m
+      </Snippet>
+      <Why>Per AX_ONE_VERB_EVERY_STACK. The verb stays `gennady verify`; the config carries the differences (release variant, JVM heap, submodule-scoped linters).</Why>
+    </Pattern>
+
+    <Pattern id="PT_LINT_CHECK_NOT_REWRITE">
+      <Intent>Check formatting/style without touching the working tree.</Intent>
+      <Snippet language="bash">
+# CORRECT — reports offenders, writes nothing (what the plugin plans)
+./gradlew ktlintCheck spotlessCheck
+
+# FORBIDDEN as gates — rewrite sources in place
+./gradlew ktlintFormat
+./gradlew spotlessApply
+      </Snippet>
+      <Why>Per AX_GATES_NEVER_MUTATE. Autofix moves to the post-v1 `fix` facet, not into verify.</Why>
+    </Pattern>
+
+    <Pattern id="PT_OPT_IN_WITHOUT_WRAPPER_JAR">
+      <Intent>Verify a corp-policy repo that keeps `gradle-wrapper.jar` out of git.</Intent>
+      <Snippet language="yaml">
+stack:
+  use: [android]
+      </Snippet>
+      <Why>Per AX_WRAPPER_IS_SOURCE_OF_TRUTH. Default detection returns `null` (correct — no wrapper.jar = no wrapper). Explicit opt-in acknowledges that `./gradlew` will be materialized before verify runs (bootstrap script, CI cache) — the agent gets ENV_FAIL up front instead of a silent success.</Why>
+    </Pattern>
+
+    <Pattern id="PT_MODULE_LIMIT_ESCAPE">
+      <Intent>Cover a project whose AGP holder lives past the 32-submodule detect limit.</Intent>
+      <Snippet language="bash">
+gennady verify --root=./apps/main --all
+      </Snippet>
+      <Why>Per AX_MODULE_LIMIT_32. `ANDROID_MODULE_LIMIT_EXCEEDED` diagnostic surfaces this; the fix is scoping the plugin to the AGP-holder module, not raising the limit.</Why>
+    </Pattern>
+  </CodePatterns>
+
+  <AntiPatterns>
+    <AntiPattern id="ANTI_PER_REPO_COMMANDS">
+      <Bad>Inventing `./gradlew verify-all` / `make android-check` wrappers per repository</Bad>
+      <Why>Agents must relearn the verb in every repo; knowledge does not transfer.</Why>
+      <Instead>One verb (`gennady verify`) + committed stack config for deviations.</Instead>
+    </AntiPattern>
+
+    <AntiPattern id="ANTI_KTLINT_FORMAT_AS_GATE">
+      <Bad>./gradlew ktlintFormat  # or spotlessApply</Bad>
+      <Why>Rewrites sources during verification; the gate can never fail and the diff silently grows.</Why>
+      <Instead>./gradlew ktlintCheck / spotlessCheck / detekt (planned by the android plugin automatically when the corresponding Gradle plugin is applied).</Instead>
+    </AntiPattern>
+
+    <AntiPattern id="ANTI_BUNDLED_CHECK">
+      <Bad>./gradlew check   # as the verification command</Bad>
+      <Why>Aggregator hides which gate broke, disables `--only=android:lint`, breaks symmetry with golang/node reporting.</Why>
+      <Instead>Granular plan `assembleDebug → lintDebug → testDebugUnitTest` planned automatically; the plugin reuses the Gradle daemon so 3–6 tasks share one initialization.</Instead>
+    </AntiPattern>
+
+    <AntiPattern id="ANTI_SYSTEM_GRADLE">
+      <Bad>gradle assembleDebug   # using PATH-installed gradle</Bad>
+      <Why>Version drift with the wrapper — silent success on one machine, mysterious FAIL on another. Corp-policy repos may also require offline reproducibility that only the pinned wrapper distribution provides.</Why>
+      <Instead>Always `./gradlew`. If missing, restore the wrapper (`gradle wrapper` bootstrap) — do not fall back to system gradle.</Instead>
+    </AntiPattern>
+
+    <AntiPattern id="ANTI_LINK_BUILD_DIR">
+      <Bad>sandboxLinks: ['.gradle', '.kotlin', 'build']   # or per-submodule build/ dirs</Bad>
+      <Why>`build/` is tree state (intermediate dex, R.java, compiled .class). Linking it lets a stale artifact from a previous run produce a false PASS.</Why>
+      <Instead>Keep the declared set `['.gradle', '.kotlin']`. Cold compile per run is the correct trade — Gradle daemon + K2 incremental keep it warm enough.</Instead>
+    </AntiPattern>
+
+    <AntiPattern id="ANTI_TRUST_GRADLE_EXIT_CODE_BLINDLY">
+      <Bad>./gradlew lintDebug || echo "lint issues found"</Bad>
+      <Why>Non-zero from Gradle can mean daemon crash, JDK skew, corrupt config-cache — not "code has issues". The agent then "fixes" healthy code.</Why>
+      <Instead>The plugin declares envFail predicates on each gate (JDK skew signatures, daemon crash markers). ENV_FAIL means fix the environment, not the code.</Instead>
+    </AntiPattern>
+  </AntiPatterns>
+</AndroidSetup>

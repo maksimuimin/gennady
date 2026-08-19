@@ -5,6 +5,7 @@
 
 | Файл                   | Назначение                                                          |
 | ---------------------- | ------------------------------------------------------------------- |
+| `android-setup.xml`    | AGP-тулчейн: wrapper, Gradle-гейты, sandboxLinks, JDK skew, alias   |
 | `eslint-setup.xml`     | Политика конфигурации ESLint (severity, autofix, flat config)       |
 | `git-setup.xml`        | Настройка git: .gitignore, ветки, коммиты, хуки, secrets            |
 | `golang-setup.xml`     | Go-тулчейн: stack-плагин, немутирующие гейты, скоуп, .gennadyrc     |
