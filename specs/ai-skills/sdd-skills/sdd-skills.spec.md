@@ -6,11 +6,11 @@
 
 ## 1. Module Vision
 
-12 SDD-навыков: полный воркфлоу Specification-Driven Development — от создания спеки до верификации. Все навыки — тонкие клиенты над директивами из `ai/directives/sdd/`. Оркестраторы (sdd-execute, sdd-execute-batch) диспатчат subagent'ов с typed Handoff. sdd-check — read-only верификатор целостности артефактов.
+SDD-навыки: полный воркфлоу Specification-Driven Development — от создания спеки до верификации. Все навыки — тонкие клиенты над директивами из `ai/directives/sdd/`. Оркестраторы (sdd-execute, sdd-execute-batch) диспатчат subagent'ов с typed Handoff. sdd-check — read-only верификатор целостности артефактов. Языковые специализации `sdd-infra` (`sdd-infra-golang`, `sdd-infra-android`) — тонкие клиенты `sdd-infra`, несут язык-специфичный knowledge (плагин верификации, диагностики окружения, директиву инфры).
 
 Навыки в модуле:
 
-- **Discovery & Setup:** sdd-setup, sdd-discover, sdd-infra
+- **Discovery & Setup:** sdd-setup, sdd-discover, sdd-infra, sdd-infra-golang, sdd-infra-android
 - **Design:** sdd-module-decomposition, sdd-critic
 - **Planning:** sdd-scaffold
 - **Execution:** sdd-execute, sdd-execute-batch
@@ -168,7 +168,7 @@ _Это полный список сущностей модуля. Любое в
 - **Type:** Enumeration
 - **Purpose:** Классификация навыка по фазе SDD-воркфлоу
 - **Values:**
-  - `discover` — sdd-setup, sdd-discover, sdd-infra
+  - `discover` — sdd-setup, sdd-discover, sdd-infra, sdd-infra-golang, sdd-infra-android
   - `design` — sdd-module-decomposition, sdd-critic
   - `plan` — sdd-scaffold
   - `execute` — sdd-execute, sdd-execute-batch
@@ -252,6 +252,8 @@ ai/skills/
 ├── sdd-setup/SKILL.md
 ├── sdd-discover/SKILL.md
 ├── sdd-infra/SKILL.md
+├── sdd-infra-golang/SKILL.md
+├── sdd-infra-android/SKILL.md
 ├── sdd-module-decomposition/SKILL.md
 ├── sdd-critic/SKILL.md
 ├── sdd-scaffold/SKILL.md
