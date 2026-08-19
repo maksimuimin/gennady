@@ -1,0 +1,185 @@
+<AndroidTestingRules keywords="android, testing, junit4, junit5, robolectric, androidx-test, kotlin, gradle" type="testing-rules" ver="1.0">
+  <Mission>
+    Canonical baseline for testing Android/Kotlin projects: local unit tests on JVM (JUnit4/JUnit5), instrumented tests under `src/androidTest/**` (AndroidX Test), and Robolectric bridges when a JVM unit test genuinely needs Android SDK primitives. Every execution-agent MUST place tests in the correct source set, avoid the `Local test lies about Android runtime` foot-gun, and treat instrumented tests as out-of-scope for the SDD verify loop (no emulator/device in `gennady verify`; that class of test is CI-only or `extraGates`).
+
+    **Base axiom:** the Android source-set layout (`src/test/` vs `src/androidTest/`) is a contract, not a suggestion. A local test that imports `android.content.Context` and mocks it convinces the reviewer of a runtime property it never actually verified. Discipline: local unit = pure JVM, no Android framework classes; instrumented = real device/emulator via AndroidX Test; Robolectric = JVM with real Android framework classes when the tested contract requires them.
+
+    Scope: JUnit4/JUnit5-based `src/test/**` (local unit) + `src/androidTest/**` (instrumented) + Robolectric. Out of scope: Jetpack Compose UI test, Paparazzi screenshot, Espresso interaction — separate directives to be layered on top later.
+  </Mission>
+
+  <DependsOn>
+    - ai/directives/testing/common.xml
+    - ai/directives/coding/kotlin-rules.xml
+  </DependsOn>
+
+  <BeliefState>
+    <Axiom id="AX_ANDROID_TEST_SOURCE_SET_CONTRACT">
+      Test source set is not a stylistic choice — it changes what runs and where. `src/test/java` and `src/test/kotlin` run on the developer's JVM through the `testDebugUnitTest` Gradle task (fast, in-process, no Android framework unless Robolectric is present). `src/androidTest/java` and `src/androidTest/kotlin` run on a real device or emulator through the `connectedAndroidTest` task (slow, real Android runtime). Putting an instrumented test in `src/test/` produces a `NoClassDefFoundError` or a silent stub call at runtime; putting a pure JVM test in `src/androidTest/` wastes device time and blocks CI.
+    </Axiom>
+
+    <Axiom id="AX_ANDROID_TEST_LOCAL_NO_FRAMEWORK">
+      A local unit test in `src/test/**` MUST NOT import `android.*` classes directly, and MUST NOT mock them with `mockito`/`mockk` to pretend the framework is present. If the test genuinely needs an Android framework class, the correct answer is one of: (a) refactor production code so the framework dependency is injected as an interface with a JVM stub in tests; (b) move the test to `src/androidTest/**`; (c) use Robolectric explicitly (AX_ANDROID_TEST_ROBOLECTRIC_OPT_IN). Mocking the framework in a local test is a lie about the runtime.
+    </Axiom>
+
+    <Axiom id="AX_ANDROID_TEST_INSTRUMENTED_OUT_OF_VERIFY_LOOP">
+      `connectedAndroidTest` is deliberately excluded from `gennady verify` base plan (D-STACK-015): it requires an emulator/device, orthogonal to the SDD execute→verify inner loop. Instrumented tests are authored under `src/androidTest/**` and executed in CI or manually; if a project needs them in the local loop for a specific pipeline, declare via `stack.android.extraGates` — not by moving instrumented tests into `src/test/`.
+    </Axiom>
+
+    <Axiom id="AX_ANDROID_TEST_ROBOLECTRIC_OPT_IN">
+      Robolectric provides Android framework classes on the JVM. Use it only when the tested contract genuinely involves Android primitives (SharedPreferences behavior, Resources parsing, a Fragment lifecycle) AND running on device is disproportionate. Declaration is explicit:
+      - `@RunWith(RobolectricTestRunner::class)` on the class (JUnit4) or `@ExtendWith(RobolectricExtension::class)` (JUnit5 via `robolectric-junit5`).
+      - `@Config(sdk = [34])` fixes the API level. Never use `@Config(sdk = [Config.NEWEST_SDK])` — silent version drift.
+      - Robolectric tests still live in `src/test/**` (they are JVM tests), but the file name convention makes it obvious: `&lt;Class&gt;RobolectricTest.kt` or a `robolectric/` subdirectory. A reviewer scanning `src/test/**` should be able to tell in one glance which tests are pure-JVM and which touch Robolectric.
+    </Axiom>
+
+    <Axiom id="AX_ANDROID_TEST_JUNIT_VERSION_ONE_PER_MODULE">
+      A module uses JUnit4 or JUnit5 — not both. Mixing runs both engines through Gradle's `useJUnitPlatform()`/`useJUnit()` dispatch and produces confusing failure attribution. JUnit5 is the default for greenfield modules (parameterized tests via `@ParameterizedTest`, nested classes via `@Nested`, dynamic tests). JUnit4 is retained only when the module depends on legacy runners (`AndroidJUnit4`, `MockitoJUnitRunner`) that lack a JUnit5 counterpart in the project's dependency set. Version choice is fixed at the module `build.gradle{.kts}` — no per-file switching.
+    </Axiom>
+
+    <Axiom id="AX_ANDROID_TEST_ANDROIDX_TEST_FOR_INSTRUMENTED">
+      Instrumented tests in `src/androidTest/**` use AndroidX Test — `androidx.test:runner`, `androidx.test:core`, `androidx.test.ext:junit`. The runner declaration is `@RunWith(AndroidJUnit4::class)` on the class. Legacy `android.test.*` and `android.support.test.*` are archived — new tests must NOT introduce them; old tests should migrate opportunistically when the file is touched.
+    </Axiom>
+
+    <Axiom id="AX_ANDROID_TEST_NAMING_AND_LAYOUT">
+      File name matches the class under test with the `Test` suffix: `UserRepositoryTest.kt`, `UserRepositoryRobolectricTest.kt`, `UserRepositoryInstrumentedTest.kt`. One production class per test file (multi-class exceptions are pair-programming-obvious data-class bundles). Test method names use Kotlin's backtick-quoted syntax to spell scenarios in a readable form: `` `returns cached user when repository is warm`() ``. Backticks are the JUnit5-compatible way to keep BDD-style scenario names in Kotlin without a separate DSL.
+    </Axiom>
+
+    <Axiom id="AX_ANDROID_TEST_BDD_MAPPING">
+      BDD scenarios from the task ticket §4 map to test methods with a 1:1 correspondence — either through the `` `&lt;scenario-name&gt;`() `` backtick convention (JUnit5) or through `@DisplayName("&lt;scenario-name&gt;")` on a conventionally named method (JUnit4/JUnit5). This makes ticket §4 → test-file traceability mechanical: `grep &lt;scenario-name&gt;` finds the test.
+    </Axiom>
+
+    <Axiom id="AX_ANDROID_TEST_NO_HIDDEN_MUTATION_IN_SETUP">
+      `@Before` / `@BeforeEach` sets up fixtures. It MUST NOT mutate shared static state, MUST NOT hit the network, MUST NOT open files outside `@TempDir` (JUnit5) / `TemporaryFolder` (JUnit4). Fixture factories are the default; per-case builders live inside the case, not in a shared field, unless the field is `val` and immutable. See `testing-common` for the general rule; Android-specific reinforcement: shared `Context`/`Application` instances are a common leak vector — obtain via `ApplicationProvider.getApplicationContext()` (Robolectric) per test, not stashed in a companion object.
+    </Axiom>
+
+    <Axiom id="AX_ANDROID_TEST_INHERITED_TESTING_COMMON">
+      All `testing-common` discipline applies unchanged: unified context per file, factory-over-hooks, file-size budget, snapshot-operator-confirm, no auto-mocking framework classes without operator sign-off. This directive only adds Android-specific overlays — it does NOT relax inherited rules.
+    </Axiom>
+  </BeliefState>
+
+  <Definitions>
+    <Definition id="DEF_LOCAL_UNIT_TEST">
+      A JUnit4/JUnit5 test under `src/test/**` executed on the developer's JVM via `./gradlew testDebugUnitTest`. Pure Kotlin/Java; no Android framework unless Robolectric is explicitly opted in.
+    </Definition>
+    <Definition id="DEF_INSTRUMENTED_TEST">
+      A test under `src/androidTest/**` executed on a real device or emulator via `./gradlew connectedAndroidTest`. Uses AndroidX Test; `@RunWith(AndroidJUnit4::class)`. Excluded from `gennady verify` base plan.
+    </Definition>
+    <Definition id="DEF_ROBOLECTRIC_TEST">
+      A local JVM test that uses the Robolectric runner to obtain shadowed Android framework classes without a device. Still lives under `src/test/**`; opt-in via `@RunWith(RobolectricTestRunner::class)` and `@Config(sdk = [N])`.
+    </Definition>
+  </Definitions>
+
+  <CodePatterns>
+    <Pattern id="PT_ANDROID_LOCAL_UNIT_JUNIT5">
+      <Intent>Baseline local unit test — JUnit5, no Android framework, backtick scenario name.</Intent>
+      <Good>
+        <![CDATA[
+        // src/test/kotlin/com/example/user/UserFormatterTest.kt
+        package com.example.user
+
+        import org.junit.jupiter.api.Assertions.assertEquals
+        import org.junit.jupiter.api.Test
+
+        class UserFormatterTest {
+            @Test
+            fun `formats a user with first and last name`() {
+                val user = User(first = "Ada", last = "Lovelace")
+                assertEquals("Ada Lovelace", UserFormatter.format(user))
+            }
+        }
+        ]]>
+      </Good>
+      <Bad reason="Mocks android.content.Context in a local test — lies about the runtime (AX_ANDROID_TEST_LOCAL_NO_FRAMEWORK).">
+        <![CDATA[
+        class UserFormatterTest {
+            @Test
+            fun formats() {
+                val context = mockk<android.content.Context>()
+                every { context.getString(any()) } returns "Ada Lovelace"
+                // …
+            }
+        }
+        ]]>
+      </Bad>
+    </Pattern>
+
+    <Pattern id="PT_ANDROID_ROBOLECTRIC">
+      <Intent>Local JVM test that legitimately needs Android framework — opt into Robolectric with explicit SDK.</Intent>
+      <Good>
+        <![CDATA[
+        // src/test/kotlin/com/example/prefs/UserPrefsRobolectricTest.kt
+        package com.example.prefs
+
+        import android.content.Context
+        import androidx.test.core.app.ApplicationProvider
+        import org.junit.Test
+        import org.junit.runner.RunWith
+        import org.robolectric.RobolectricTestRunner
+        import org.robolectric.annotation.Config
+        import kotlin.test.assertEquals
+
+        @RunWith(RobolectricTestRunner::class)
+        @Config(sdk = [34])
+        class UserPrefsRobolectricTest {
+            @Test
+            fun `writes and reads back a nickname`() {
+                val ctx: Context = ApplicationProvider.getApplicationContext()
+                val prefs = UserPrefs(ctx)
+                prefs.setNickname("ada")
+                assertEquals("ada", prefs.getNickname())
+            }
+        }
+        ]]>
+      </Good>
+    </Pattern>
+
+    <Pattern id="PT_ANDROID_INSTRUMENTED">
+      <Intent>Instrumented test in the correct source set — AndroidX Test, out of the verify loop.</Intent>
+      <Good>
+        <![CDATA[
+        // src/androidTest/kotlin/com/example/db/UserDaoInstrumentedTest.kt
+        package com.example.db
+
+        import androidx.test.ext.junit.runners.AndroidJUnit4
+        import androidx.test.platform.app.InstrumentationRegistry
+        import androidx.room.Room
+        import org.junit.After
+        import org.junit.Before
+        import org.junit.Test
+        import org.junit.runner.RunWith
+        import kotlin.test.assertEquals
+
+        @RunWith(AndroidJUnit4::class)
+        class UserDaoInstrumentedTest {
+            private lateinit var db: UserDatabase
+
+            @Before fun setUp() {
+                val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+                db = Room.inMemoryDatabaseBuilder(ctx, UserDatabase::class.java).build()
+            }
+
+            @After fun tearDown() { db.close() }
+
+            @Test fun `inserts and reads back a user`() {
+                val dao = db.userDao()
+                dao.insert(UserEntity(id = 1, name = "Ada"))
+                assertEquals("Ada", dao.byId(1)?.name)
+            }
+        }
+        ]]>
+      </Good>
+    </Pattern>
+  </CodePatterns>
+
+  <SelfCheck>
+    Before marking any Android test file done:
+    1. File is in the correct source set (`src/test/**` for JVM, `src/androidTest/**` for device).
+    2. Local JVM tests import no `android.*` classes unless Robolectric is opted in with explicit `@Config(sdk = [N])`.
+    3. Test class uses one JUnit version (4 or 5), matching the module's `build.gradle{.kts}`.
+    4. Test methods spell scenarios via backticks or `@DisplayName` — reviewable against ticket §4 by grep.
+    5. No mocking of Android framework classes in local unit tests.
+    6. Instrumented tests use `@RunWith(AndroidJUnit4::class)` and AndroidX Test primitives.
+    7. Robolectric tests declare explicit `@Config(sdk = [N])`, not `NEWEST_SDK`.
+    8. `testing-common` axioms (unified context, factory-over-hooks, file budget) hold.
+  </SelfCheck>
+</AndroidTestingRules>
